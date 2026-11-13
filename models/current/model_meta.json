@@ -1,0 +1,29 @@
+{
+  "model_version": "v0.2-synthetic",
+  "model_file": "model.txt",
+  "feature_names": [
+    "amount",
+    "log_amount",
+    "is_transfer",
+    "is_cash_out",
+    "hour_of_day",
+    "amount_to_balance",
+    "drains_balance",
+    "dest_balance_zero",
+    "count_60s",
+    "count_1h",
+    "count_24h",
+    "sum_1h",
+    "avg_amount_24h",
+    "amount_vs_avg_24h",
+    "seconds_since_last",
+    "is_new_counterparty",
+    "is_new_device",
+    "dest_senders_1h"
+  ],
+  "threshold_review": 0.9999993368041152,
+  "alert_rate": 0.01,
+  "trained_at": "2026-11-13T16:18:44.578856+00:00",
+  "data": "data/synthetic/transactions.csv",
+  "rows": 200000
+}

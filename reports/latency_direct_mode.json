@@ -1,0 +1,1 @@
+{"window_s" : 60, "samples" : 3047, "tps" : 50.8, "pipeline_ms" : [30.1, 51.6, 103.5], "inference_ms" : [0.332, 0.475, 2.301], "feature_ms" : [1.000, 3.046, 6.400]}

@@ -1,0 +1,136 @@
+# Local platform. Start only what a milestone needs:
+#   docker compose up -d                       infra: Kafka, Redis, PostgreSQL
+#   docker compose --profile spark up -d       + Spark streaming (validate/forward + lake)
+#   docker compose --profile app up -d         + generator, scorer, API, dashboard
+# The environment (demo or production) comes from .env; see .env.demo.
+#   docker compose --profile obs up -d         + Prometheus, Grafana
+name: vyrox
+
+x-python: &python
+  build: { context: ., dockerfile: docker/python.Dockerfile }
+  image: vyrox-python:dev
+  env_file: .env
+  restart: unless-stopped
+  depends_on:
+    kafka-init: { condition: service_completed_successfully }
+    redis: { condition: service_healthy }
+    postgres: { condition: service_healthy }
+
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 72
+    ports: ["29092:29092"]
+    volumes: [kafka-data:/var/lib/kafka/data]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      retries: 30
+
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on: { kafka: { condition: service_healthy } }
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-demo}
+    volumes: [./infra/kafka/create-topics.sh:/create-topics.sh:ro]
+    entrypoint: ["bash", "/create-topics.sh"]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    ports: ["6379:6379"]
+    volumes: [redis-data:/data]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, retries: 20 }
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fraud
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud}
+      POSTGRES_DB: vyrox_${ENVIRONMENT:-demo}
+    ports: ["5432:5432"]
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U fraud -d vyrox_${ENVIRONMENT:-demo}"], interval: 5s, retries: 20 }
+
+  generator:
+    <<: *python
+    profiles: [app]
+    command: ["python", "services/generator/generator.py", "--mode", "kafka", "--rate", "${GENERATOR_RATE:-50}"]
+
+  scorer:
+    <<: *python
+    profiles: [app]
+    command: ["python", "-m", "services.scorer.app.consumer"]
+    ports: ["9101:9101"]
+
+  api:
+    <<: *python
+    profiles: [app]
+    command: ["uvicorn", "services.scorer.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1",
+              "--timeout-graceful-shutdown", "3"]
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"]
+      interval: 10s
+
+  dashboard:
+    build: { context: services/dashboard }
+    profiles: [app]
+    ports: ["3000:80"]
+    depends_on: [api]
+
+  spark:
+    build: { context: ., dockerfile: docker/spark.Dockerfile }
+    profiles: [spark]
+    env_file: .env
+    environment:
+      LAKE_PATH: /data/lake
+      KAFKA_BOOTSTRAP: kafka:9092
+    volumes:
+      - lake:/data/lake
+      - ivy-cache:/home/spark/.ivy2
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: [obs]
+    volumes: [./infra/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro]
+    ports: ["9090:9090"]
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.8.0
+    profiles: [obs]
+    command: ["--kafka.server=kafka:9092"]
+    depends_on: [kafka]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    profiles: [obs]
+    ports: ["3001:3000"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    depends_on: [prometheus]
+
+volumes:
+  kafka-data:
+  redis-data:
+  pg-data:
+  lake:
+  ivy-cache:

@@ -1,0 +1,82 @@
+{
+  "pipeline_mode": "spark",
+  "post_to_dashboard_push_s": 0.638,
+  "kafka_path": [
+    "demo.payments.transactions.v1[4]@10089",
+    "demo.payments.transactions.validated.v1[5]@10539",
+    "demo.payments.scored.v1[0]@9790"
+  ],
+  "prediction": {
+    "risk_score": 0.999974,
+    "risk_level": "CRITICAL",
+    "decision": "HOLD",
+    "reason_codes": [
+      "BALANCE_DRAIN",
+      "NEW_COUNTERPARTY_HIGH_AMOUNT",
+      "BEHAVIOUR_CHANGE",
+      "EMPTY_DESTINATION_ACCOUNT",
+      "AMOUNT_PATTERN",
+      "HIGH_RISK_TXN_TYPE"
+    ],
+    "model_version": "v0.2-synthetic",
+    "inference_ms": 3.198
+  },
+  "risky_txn": "TXN_ACC_b758c74b64b9",
+  "alert": {
+    "alert_id": 454,
+    "priority": 1,
+    "trigger_types": [
+      "RISK_SCORE",
+      "AMOUNT",
+      "BEHAVIOUR"
+    ],
+    "assigned_to": "analyst-1"
+  },
+  "duplicates": {
+    "deliveries": 6,
+    "predictions": 1,
+    "alerts": 1
+  },
+  "performance": {
+    "window_minutes": 5,
+    "samples": 7161,
+    "throughput_tps": 35.96,
+    "pipeline_ms": {
+      "p50": 988.649,
+      "p95": 2060.086,
+      "p99": 2866.525
+    },
+    "inference_ms": {
+      "p50": 0.237,
+      "p95": 0.43,
+      "p99": 2.57
+    },
+    "feature_ms": {
+      "p50": 0.799,
+      "p95": 2.248,
+      "p99": 4.979
+    },
+    "ingest_ms": {
+      "p50": 1.24,
+      "p95": 4.212,
+      "p99": 4.212,
+      "samples": 12
+    },
+    "push_ms": {
+      "p50": 7.701,
+      "p95": 13.373,
+      "p99": 33.359,
+      "samples": 2000
+    },
+    "consumer_lag": 14,
+    "spark_backlog": 34,
+    "events_received": 62493,
+    "events_dead_lettered": 128,
+    "error_rate": 0.002048,
+    "measured_at": "2026-11-13T18:30:34.261123+00:00"
+  },
+  "seconds_to_show_disconnected": 6.5,
+  "seconds_to_recover_backlog": 7.6,
+  "run_at": "2026-11-13T18:30:53.861011+00:00",
+  "environment": "demo"
+}

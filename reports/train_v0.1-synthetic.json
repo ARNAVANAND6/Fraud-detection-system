@@ -1,0 +1,188 @@
+{
+  "meta": {
+    "model_version": "v0.1-synthetic",
+    "model_file": "model.txt",
+    "feature_names": [
+      "amount",
+      "log_amount",
+      "is_transfer",
+      "is_cash_out",
+      "hour_of_day",
+      "amount_to_balance",
+      "drains_balance",
+      "dest_balance_zero",
+      "count_60s",
+      "count_1h",
+      "count_24h",
+      "sum_1h",
+      "avg_amount_24h",
+      "amount_vs_avg_24h",
+      "seconds_since_last",
+      "is_new_counterparty",
+      "is_new_device"
+    ],
+    "threshold_review": 0.9992276542566566,
+    "alert_rate": 0.01,
+    "trained_at": "2026-11-06T11:34:15.173422+00:00",
+    "data": "data/synthetic/transactions.csv",
+    "rows": 200000
+  },
+  "results": {
+    "rules_baseline": {
+      "validation": {
+        "pr_auc": 0.12690239335444972,
+        "roc_auc": 0.8134433904182503,
+        "threshold": 0.55,
+        "precision": 0.13851132686084142,
+        "recall": 0.4930875576036866,
+        "f1": 0.21627084386053563,
+        "false_positive_rate": 0.045017925996076576,
+        "alerts": 1545,
+        "confusion_matrix": {
+          "tn": 28235,
+          "fp": 1331,
+          "fn": 220,
+          "tp": 214
+        }
+      },
+      "test": {
+        "pr_auc": 0.09867537899935765,
+        "roc_auc": 0.780283693098369,
+        "threshold": 0.55,
+        "precision": 0.0982083609820836,
+        "recall": 0.37468354430379747,
+        "f1": 0.15562565720294427,
+        "false_positive_rate": 0.04590440803918257,
+        "alerts": 1507,
+        "confusion_matrix": {
+          "tn": 28246,
+          "fp": 1359,
+          "fn": 247,
+          "tp": 148
+        }
+      }
+    },
+    "logistic_regression": {
+      "validation": {
+        "pr_auc": 0.8216077304424516,
+        "roc_auc": 0.9951614150143193,
+        "threshold": 0.9924698573244228,
+        "precision": 0.8433333333333334,
+        "recall": 0.5829493087557603,
+        "f1": 0.6893732970027248,
+        "false_positive_rate": 0.001589663803016979,
+        "alerts": 300,
+        "confusion_matrix": {
+          "tn": 29519,
+          "fp": 47,
+          "fn": 181,
+          "tp": 253
+        }
+      },
+      "test": {
+        "pr_auc": 0.8713493522566461,
+        "roc_auc": 0.9962361814524145,
+        "threshold": 0.9924698573244228,
+        "precision": 0.860248447204969,
+        "recall": 0.7012658227848101,
+        "f1": 0.7726638772663877,
+        "false_positive_rate": 0.001520013511231211,
+        "alerts": 322,
+        "confusion_matrix": {
+          "tn": 29560,
+          "fp": 45,
+          "fn": 118,
+          "tp": 277
+        }
+      }
+    },
+    "random_forest": {
+      "validation": {
+        "pr_auc": 0.97585564155469,
+        "roc_auc": 0.9994561881548458,
+        "threshold": 0.8595200159909487,
+        "precision": 0.99,
+        "recall": 0.684331797235023,
+        "f1": 0.8092643051771117,
+        "false_positive_rate": 0.0001014679023202327,
+        "alerts": 300,
+        "confusion_matrix": {
+          "tn": 29563,
+          "fp": 3,
+          "fn": 137,
+          "tp": 297
+        }
+      },
+      "test": {
+        "pr_auc": 0.9784769621959838,
+        "roc_auc": 0.9994622016893315,
+        "threshold": 0.8595200159909487,
+        "precision": 0.9869281045751634,
+        "recall": 0.7645569620253164,
+        "f1": 0.8616262482168331,
+        "false_positive_rate": 0.00013511231210944097,
+        "alerts": 306,
+        "confusion_matrix": {
+          "tn": 29601,
+          "fp": 4,
+          "fn": 93,
+          "tp": 302
+        }
+      }
+    },
+    "lightgbm": {
+      "validation": {
+        "pr_auc": 0.9824176793435669,
+        "roc_auc": 0.9995360687999137,
+        "threshold": 0.9992276542566566,
+        "precision": 0.9933333333333333,
+        "recall": 0.6866359447004609,
+        "f1": 0.8119891008174387,
+        "false_positive_rate": 6.764526821348847e-05,
+        "alerts": 300,
+        "confusion_matrix": {
+          "tn": 29564,
+          "fp": 2,
+          "fn": 136,
+          "tp": 298
+        }
+      },
+      "test": {
+        "pr_auc": 0.9869966735837988,
+        "roc_auc": 0.9996883010268108,
+        "threshold": 0.9992276542566566,
+        "precision": 0.996996996996997,
+        "recall": 0.8405063291139241,
+        "f1": 0.9120879120879121,
+        "false_positive_rate": 3.377807802736024e-05,
+        "alerts": 333,
+        "confusion_matrix": {
+          "tn": 29604,
+          "fp": 1,
+          "fn": 63,
+          "tp": 332
+        }
+      }
+    }
+  },
+  "lightgbm_gain_importance": {
+    "is_transfer": 2898484.7574765086,
+    "amount_vs_avg_24h": 842961.4337009788,
+    "amount_to_balance": 565527.07055825,
+    "seconds_since_last": 273113.25245809555,
+    "amount": 184171.47236090899,
+    "dest_balance_zero": 84704.0627028346,
+    "is_cash_out": 83231.44248259068,
+    "avg_amount_24h": 31990.907489478588,
+    "count_1h": 25001.872285485268,
+    "count_60s": 24984.79072254896,
+    "sum_1h": 17333.34140342474,
+    "log_amount": 14340.329796850681,
+    "is_new_device": 13607.83675646782,
+    "is_new_counterparty": 3168.978664159775,
+    "drains_balance": 1971.1981619000435,
+    "count_24h": 1813.5946698188782,
+    "hour_of_day": 0.0
+  },
+  "caveat": "Synthetic data from this project's own simulator; not real-world performance."
+}

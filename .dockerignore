@@ -1,0 +1,6 @@
+data/
+.git/
+**/node_modules/
+**/__pycache__/
+services/dashboard/dist/
+reports/
