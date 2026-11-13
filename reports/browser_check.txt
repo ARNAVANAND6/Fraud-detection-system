@@ -1,12 +1,12 @@
 PASS  environment badge is shown  
-PASS  transaction appears in the live feed  1350 ms after the POST
+PASS  transaction appears in the live feed  216 ms after the POST
 PASS  KPIs changed with no page reload  navigations during the test: 0
 PASS  disconnected state is shown  6.9 s after the scorer stopped
 PASS  banner explains the outage  
 PASS  feed is no longer titled live  
 PASS  content is dimmed while not live  
 PASS  nothing new is shown while disconnected  
-PASS  held transaction appears after reconnect  7.3 s after restart
+PASS  held transaction appears after reconnect  6.3 s after restart
 PASS  status returns to live  
 PASS  lost server connection is shown  
 PASS  page says the figures are not live  

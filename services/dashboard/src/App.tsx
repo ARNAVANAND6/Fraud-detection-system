@@ -4,6 +4,7 @@ import {
 } from "./api";
 import { LEVEL_COLOR, LEVEL_ICON, MinuteSeries, RiskDistribution } from "./charts";
 import { Live, useLive } from "./live";
+import { Scene3D } from "./Scene3D";
 
 type Tab = "overview" | "alerts" | "performance" | "ingest" | "settings";
 type Health = "live" | "idle" | "delayed" | "disconnected" | "offline" | "connecting";
@@ -63,7 +64,7 @@ function Chips({ items }: { items: string[] }) {
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
   const [source, setSource] = useState<Source | null>(null);
-  const seed = useCallback(() => api.recent(100, null), []);
+  const seed = useCallback(() => api.recent(500, null), []);
   const live = useLive(seed);
   const now = useNow();
   const h = health(live);
@@ -165,6 +166,10 @@ function Overview({ stats, feed, live, source, now, onOpen, isLive }: {
   stats: Stats | null; feed: Txn[]; live: Live; source: Source | null; now: number; onOpen: (id: string) => void; isLive: boolean;
 }) {
   const [suspicious, setSuspicious] = useState(false);
+  const [thresholds, setThresholds] = useState<Policy["thresholds"] | null>(null);
+  const [show3d, setShow3d] = useState(() => { try { return localStorage.getItem("vyrox-3d") !== "off"; } catch { return true; } });
+  const toggle3d = () => setShow3d((v) => { try { localStorage.setItem("vyrox-3d", v ? "off" : "on"); } catch { /* preference not saved */ } return !v; });
+  useEffect(() => { api.config().then((p) => setThresholds(p.thresholds)).catch(() => undefined); }, [live.conn]);
   if (!stats) return <div className="empty">No data received from the server yet.</div>;
   const rows = (suspicious ? feed.filter((t) => t.risk_level === "HIGH" || t.risk_level === "CRITICAL") : feed).slice(0, 40);
   const mixed = !source && stats.by_source.length > 1;
@@ -187,6 +192,14 @@ function Overview({ stats, feed, live, source, now, onOpen, isLive }: {
           "Data source" filter in the header restricts every figure to one source.
         </div>
       )}
+
+      <div className="panel">
+        <div className="panel-head">
+          <h3>Live transaction space <span className="muted">each point is one stored transaction: amount across, risk score up, age into the distance</span></h3>
+          <button onClick={toggle3d}>{show3d ? "Hide 3D view" : "Show 3D view"}</button>
+        </div>
+        {show3d && <Scene3D feed={feed} isLive={isLive} frozenAt={live.lastMessageAt} clockOffset={live.clockOffset} thresholds={thresholds} onOpen={onOpen} />}
+      </div>
 
       <div className="grid2">
         <div className="panel">

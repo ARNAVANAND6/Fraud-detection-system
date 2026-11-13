@@ -16,6 +16,15 @@ the running system.
 ![Live dashboard](docs/screenshots/live.png)
 ![Stream disconnected](docs/screenshots/disconnected.png)
 
+The 3D panel at the top of the overview plots every transaction of the last
+20 seconds: amount across, risk score up, age into the distance. Each point
+is a stored record pushed by the backend, and points move only because they
+age. When the stream is not live the clock stops, so the view freezes and
+dims. It is a plain canvas with a hand-written projection (no WebGL, no 3D
+library), capped at 20 frames per second and idle while hidden. In a headless
+browser with software rendering it used about a quarter of one CPU core at 50
+events per second; it can be switched off from the panel.
+
 ## The path of one transaction
 
 ```

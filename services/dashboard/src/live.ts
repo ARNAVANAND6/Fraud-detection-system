@@ -10,7 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import { Alert, BASE, KEY, Stats, Status, Txn } from "./api";
 
 export type Conn = "connecting" | "connected" | "disconnected";
-const FEED_SIZE = 200;
+const FEED_SIZE = 1200; // per source; enough for the 3D view's 20-second window at about 50 events per second
 const SILENCE_MS = 6000; // the server sends a status event every second
 
 export interface Live {
@@ -25,6 +25,7 @@ export interface Live {
   delivery: { p50: number; p95: number; p99: number; samples: number } | null; // persisted -> this browser
   received: number;               // transaction events received since the page loaded
   reconnects: number;
+  clockOffset: number;            // browser clock minus server clock, ms (0 until first status)
 }
 
 function percentile(sorted: number[], q: number): number {
@@ -34,7 +35,7 @@ function percentile(sorted: number[], q: number): number {
 export function useLive(seedFeed: () => Promise<Txn[]>): Live {
   const [live, setLive] = useState<Live>({
     conn: "connecting", connectedSince: null, lastMessageAt: null, status: null, stats: null, feed: [],
-    alertTick: 0, lastAlert: null, delivery: null, received: 0, reconnects: 0,
+    alertTick: 0, lastAlert: null, delivery: null, received: 0, reconnects: 0, clockOffset: 0,
   });
   const seedRef = useRef(seedFeed);
   seedRef.current = seedFeed;
@@ -85,6 +86,7 @@ export function useLive(seedFeed: () => Promise<Txn[]>): Live {
       if (event === "status") {
         offset = Math.min(offset, now - Date.parse(body.server_time));
         patch.status = body;
+        patch.clockOffset = offset;
       } else if (event === "stats") {
         patch.stats = body;
       } else if (event === "transaction") {
