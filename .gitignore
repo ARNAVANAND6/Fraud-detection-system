@@ -1,0 +1,12 @@
+.env
+data/
+reports/generator_last_run.json
+__pycache__/
+.pytest_cache/
+node_modules/
+services/dashboard/dist/
+models/*
+!models/current/
+logs/
+.env.production
+*.tsbuildinfo
