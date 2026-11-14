@@ -15,6 +15,9 @@ import math
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+
+import numpy as np
 
 from .schemas import TransactionEvent, TxnType
 
@@ -139,6 +142,105 @@ class OfflineFeatureBuilder:
             if e.txn_type in FAN_IN_TYPES:
                 inbound.append((now, e.account_id))
         return [o for o in out if o is not None]
+
+
+class _Row:
+    """The fields compute_features reads, without the cost of a validated event."""
+
+    __slots__ = ("amount", "txn_type", "event_time", "event_ms", "old_balance_orig", "old_balance_dest", "device_id")
+
+
+def _first_seen(keys: np.ndarray, ms: np.ndarray) -> np.ndarray:
+    """For each row, the earliest event time at which its key appears anywhere."""
+    _, inverse = np.unique(keys, return_inverse=True)
+    first = np.full(int(inverse.max()) + 1 if len(inverse) else 0, np.iinfo(np.int64).max, dtype=np.int64)
+    np.minimum.at(first, inverse, ms)
+    return first[inverse]
+
+
+def build_feature_matrix(
+    event_ms: np.ndarray,
+    account: np.ndarray,
+    counterparty: np.ndarray,
+    device: np.ndarray,
+    has_device: np.ndarray,
+    txn_type: list[TxnType] | np.ndarray,
+    amount: np.ndarray,
+    old_balance_orig: np.ndarray,
+    old_balance_dest: np.ndarray,
+    block: int = 100_000,
+) -> np.ndarray:
+    """Same features as OfflineFeatureBuilder.build, for data too large to hold as event objects.
+
+    Takes one array per column (ids as integers, for example 64-bit hashes of
+    the original strings) and returns a float32 matrix, rows in input order,
+    columns in FEATURE_NAMES order. Every value still comes from
+    compute_features; the difference is only in how history is held:
+
+    - "seen before" for (account, counterparty) and (account, device) is worked
+      out up front from the whole column instead of a dict that grows forever;
+    - per-account history and per-destination inbound lists are dropped once
+      they fall outside the longest window, so memory follows the number of
+      accounts active in 24 h, not the size of the dataset.
+
+    tests/unit/test_features.py asserts the output equals OfflineFeatureBuilder.build.
+    """
+    n = len(event_ms)
+    event_ms = np.asarray(event_ms, dtype=np.int64)
+    account = np.asarray(account).astype(np.uint64)
+    counterparty = np.asarray(counterparty).astype(np.uint64)
+    device = np.asarray(device).astype(np.uint64)
+    mix = np.uint64(0x9E3779B97F4A7C15)
+    with np.errstate(over="ignore"):
+        cp_first = _first_seen(account * mix ^ counterparty, event_ms)
+        dev_first = _first_seen(account * mix ^ device, event_ms)
+    order = np.argsort(event_ms, kind="stable")
+    types = list(TxnType)
+    type_code = np.asarray([types.index(t) for t in txn_type], dtype=np.int8) if not isinstance(txn_type, np.ndarray) \
+        else txn_type.astype(np.int8)
+    fan_in = {types.index(t) for t in FAN_IN_TYPES}
+
+    out = np.empty((n, len(FEATURE_NAMES)), dtype=np.float32)
+    history: dict[int, list[HistoryItem]] = {}
+    dest_in: dict[int, list[tuple[int, int]]] = {}
+    row = _Row()
+    empty: list = []
+    for start in range(0, n, block):
+        idx = order[start:start + block]
+        cols = zip(idx.tolist(), event_ms[idx].tolist(), account[idx].tolist(), counterparty[idx].tolist(),
+                   has_device[idx].tolist(), type_code[idx].tolist(), amount[idx].tolist(),
+                   old_balance_orig[idx].tolist(), old_balance_dest[idx].tolist(),
+                   cp_first[idx].tolist(), dev_first[idx].tolist(), strict=True)
+        for i, now, acct, dest, has_dev, tcode, amt, bal_o, bal_d, cp_seen, dev_seen in cols:
+            inbound = dest_in.get(dest)
+            if inbound:
+                while inbound and inbound[0][0] < now - WINDOW_1H:
+                    inbound.pop(0)  # safe: events are replayed in time order
+            row.amount, row.txn_type, row.event_ms = amt, types[tcode], now
+            row.event_time = datetime.fromtimestamp(now / 1000, UTC)
+            row.old_balance_orig, row.old_balance_dest = bal_o, bal_d
+            row.device_id = "d" if has_dev else None
+            hist = history.get(acct)
+            f = compute_features(
+                row, hist or empty, cp_seen, dev_seen if has_dev else None,
+                len({sender for ts, sender in inbound if ts < now}) if inbound else 0,
+            )
+            out[i] = [f[name] for name in FEATURE_NAMES]
+            if hist is None:
+                hist = history[acct] = []
+            hist.append(HistoryItem(now, amt))
+            if len(hist) > 64 and hist[0].ts_ms < now - WINDOW_24H:
+                history[acct] = [h for h in hist if h.ts_ms >= now - WINDOW_24H]
+            if tcode in fan_in:
+                if inbound is None:
+                    inbound = dest_in[dest] = []
+                inbound.append((now, acct))
+        # Drop state that can no longer affect any later row.
+        if len(idx):
+            now = int(event_ms[idx[-1]])
+            history = {k: v for k, v in history.items() if v[-1].ts_ms >= now - WINDOW_24H}
+            dest_in = {k: v for k, v in dest_in.items() if v and v[-1][0] >= now - WINDOW_1H}
+    return out
 
 
 class RedisFeatureStore:

@@ -93,3 +93,35 @@ def test_fan_in_parity_offline_online():
     store = RedisFeatureStore(fakeredis.FakeRedis())
     online = [store.get_and_update(e)["dest_senders_1h"] for e in events]
     assert online == [x["dest_senders_1h"] for x in OfflineFeatureBuilder().build(events)]
+
+
+def test_feature_matrix_matches_offline_builder():
+    """The low-memory training path must give exactly what OfflineFeatureBuilder gives."""
+    import numpy as np
+    from fraudlib.features import build_feature_matrix
+
+    events = random_events(n=1500, seed=11)
+    # Same-millisecond ties, and a gap long enough for state to be dropped and rebuilt.
+    events += [ev(9000, acct="C1", secs=events[-1].event_ms / 1000 - T0.timestamp(), cp="P1"),
+               ev(9001, acct="C1", secs=events[-1].event_ms / 1000 - T0.timestamp(), cp="P1")]
+    events += [ev(9100 + i, acct=f"C{i % 3}", secs=400_000 + i * 7, cp=f"P{i % 4}", device=None,
+                  txn_type="PAYMENT" if i % 2 else "CASH_OUT") for i in range(50)]
+    random.Random(3).shuffle(events)
+
+    ids = {s: n for n, s in enumerate(sorted({e.account_id for e in events} | {e.counterparty_id for e in events}
+                                             | {e.device_id or "" for e in events}))}
+    got = build_feature_matrix(
+        event_ms=np.array([e.event_ms for e in events]),
+        account=np.array([ids[e.account_id] for e in events]),
+        counterparty=np.array([ids[e.counterparty_id] for e in events]),
+        device=np.array([ids[e.device_id or ""] for e in events]),
+        has_device=np.array([e.device_id is not None for e in events]),
+        txn_type=[e.txn_type for e in events],
+        amount=np.array([e.amount for e in events]),
+        old_balance_orig=np.array([e.old_balance_orig for e in events]),
+        old_balance_dest=np.array([e.old_balance_dest for e in events]),
+        block=97,  # small blocks so the state clean-up runs many times
+    )
+    want = np.array([[f[n] for n in FEATURE_NAMES] for f in OfflineFeatureBuilder().build(events)], dtype=np.float32)
+    assert got.shape == want.shape
+    assert np.array_equal(got, want)
