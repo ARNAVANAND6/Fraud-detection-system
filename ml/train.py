@@ -122,6 +122,10 @@ def main() -> None:
         "lightgbm": lgb.LGBMClassifier(n_estimators=400, learning_rate=0.05, num_leaves=31,
                                        min_child_samples=50, subsample=0.8, subsample_freq=1,
                                        colsample_bytree=0.8, scale_pos_weight=pos_weight,
+                                       # Caps each leaf's output. Without it, a class weight in the
+                                       # thousands (PaySim: ~1,800) lets leaf values run away and the
+                                       # scores saturate at 1.0.
+                                       max_delta_step=1.0,
                                        random_state=0, verbose=-1),
     }
     # XGBoost slots in the same way (xgboost.XGBClassifier) once installed.
@@ -155,7 +159,9 @@ def main() -> None:
     (out_dir / "model_meta.json").write_text(json.dumps(meta, indent=2))
     Path("reports").mkdir(exist_ok=True)
     report = {"meta": meta, "results": results, "lightgbm_gain_importance": importance,
-              "caveat": "Synthetic data from this project's own simulator; not real-world performance."}
+              "caveat": ("PaySim: a public simulator of mobile-money transfers, not real UPI or bank data; "
+                         "not real-world performance." if a.paysim else
+                         "Synthetic data from this project's own simulator; not real-world performance.")}
     (Path("reports") / f"train_{a.version}.json").write_text(json.dumps(report, indent=2))
     print(f"saved {out_dir} and reports/train_{a.version}.json")
 
