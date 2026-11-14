@@ -1,0 +1,7 @@
+# Keep LF line endings on every platform. With Git for Windows' default
+# (core.autocrlf=true) a checkout converted files to CRLF, which broke the
+# bash scripts run inside Linux containers and corrupted the LightGBM model
+# file ("Model format error, expect a tree here").
+* text=auto eol=lf
+*.png binary
+*.parquet binary
