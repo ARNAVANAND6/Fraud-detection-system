@@ -95,11 +95,14 @@ class ScoringWorker:
             self.policy = self.repo.get_policy()
             self._last_policy = now
         if now - self._last_escalation > 10:
-            for alert in self.repo.escalate_overdue(self.policy):
+            escalated = self.repo.escalate_overdue(self.policy)
+            for alert in escalated:
                 ALERTS.labels("escalated").inc()
-                log.info("alert escalated", extra={"alert_id": alert["alert_id"],
-                                                   "escalation_level": alert["escalation_level"]})
                 self.producer.produce(self.s.topic_scored, value=jsonlog.dumps(alert_event(alert, "ESCALATED")))
+            if escalated:
+                # One line per batch: after an outage there can be thousands.
+                log.info("alerts escalated", extra={"count": len(escalated),
+                                                    "alert_ids": [a["alert_id"] for a in escalated[:20]]})
             self._last_escalation = now
 
     # ---- one event ---------------------------------------------------------------
