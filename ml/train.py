@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -146,6 +147,13 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--alert-rate", type=float, default=0.01, help="share of traffic analysts can review")
     ap.add_argument("--version", default=datetime.now(UTC).strftime("v%Y%m%d%H%M"))
+    ap.add_argument("--device", choices=["cpu", "cuda"], default=os.environ.get("TRAIN_DEVICE", "cpu"),
+                    help="where XGBoost trains (cuda = NVIDIA GPU; XGBoost's pip package includes CUDA). "
+                         "Features, rules, logistic regression and random forest always use the CPU.")
+    ap.add_argument("--skip", default="", help="comma-separated comparison models to leave out, e.g. "
+                    "random_forest,logistic_regression (LightGBM is always trained: it is the model that is saved)")
+    ap.add_argument("--lightgbm-device", choices=["cpu", "gpu", "cuda"], default="cpu",
+                    help="gpu/cuda need a LightGBM built from source with GPU support; the pip build is CPU only")
     a = ap.parse_args()
 
     cols, times, y = load_columns(a.data, a.paysim, a.limit)
@@ -171,15 +179,38 @@ def main() -> None:
                                        # thousands (PaySim: ~1,800) lets leaf values run away and the
                                        # scores saturate at 1.0.
                                        max_delta_step=1.0,
+                                       device_type=a.lightgbm_device,
                                        random_state=0, verbose=-1),
     }
-    # XGBoost slots in the same way (xgboost.XGBClassifier) once installed.
-    results, fitted = {}, {}
+    try:
+        import xgboost as xgb
+    except ImportError:
+        xgb = None
+        print("xgboost not installed: skipping it (pip install xgboost)")
+    if xgb is not None:
+        # Same settings as LightGBM where they mean the same thing, so the two compare fairly.
+        models["xgboost"] = xgb.XGBClassifier(
+            n_estimators=400, learning_rate=0.05, max_depth=8, min_child_weight=5, subsample=0.8,
+            colsample_bytree=0.8, scale_pos_weight=pos_weight, max_delta_step=1.0,
+            tree_method="hist", device=a.device, eval_metric="aucpr", random_state=0)
+    elif a.device == "cuda":
+        sys.exit("--device cuda trains XGBoost on the GPU, but xgboost is not installed")
+    skip = {m for m in a.skip.split(",") if m}
+    if unknown := skip - (set(models) - {"lightgbm"}):
+        sys.exit(f"--skip: cannot skip {sorted(unknown)}; choose from {sorted(set(models) - {'lightgbm'})}")
+    models = {k: v for k, v in models.items() if k not in skip}
+    results, fitted, fit_seconds = {}, {}, {}
     for name, model in models.items():
         if model is None:
             score_fn = lambda df: rules_scores(df.to_numpy())
         else:
+            t_fit = time.perf_counter()
             model.fit(X[tr], y[tr])
+            fit_seconds[name] = round(time.perf_counter() - t_fit, 1)
+            if name == "xgboost" and a.device != "cpu":
+                # Trained on the GPU; the evaluation data is in CPU memory, so predict on the CPU
+                # instead of copying it over (XGBoost otherwise warns about mismatched devices).
+                model.set_params(device="cpu")
             fitted[name] = model
             score_fn = lambda df, m=model: m.predict_proba(df)[:, 1]
         p_val, p_test = score_fn(X[va]), score_fn(X[te])
@@ -200,6 +231,8 @@ def main() -> None:
         "threshold_review": results["lightgbm"]["validation"]["threshold"],
         "alert_rate": a.alert_rate, "trained_at": datetime.now(UTC).isoformat(),
         "data": str(a.data), "rows": len(y),
+        "devices": {"xgboost": a.device if "xgboost" in fitted else None, "lightgbm": a.lightgbm_device},
+        "fit_seconds": fit_seconds,
     }
     (out_dir / "model_meta.json").write_text(json.dumps(meta, indent=2))
     # What the model's inputs looked like in training, for drift monitoring at run time.

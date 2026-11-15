@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -35,6 +35,7 @@ from psycopg.rows import dict_row
 
 S = get_settings()
 API = os.environ.get("API_URL", "http://localhost:8000")
+CLOCK_SKEW_MS = float(os.environ.get("CLOCK_SKEW_MS", "5"))
 KEY = {"X-API-Key": S.api_keys[0]}
 STOP = os.environ.get("SCORER_STOP_CMD", "docker compose stop scorer")
 START = os.environ.get("SCORER_START_CMD", "docker compose start scorer")
@@ -231,7 +232,11 @@ def test_04_risk_score_is_persisted():
     post(event)
     row = wait_for(lambda: prediction(event["transaction_id"]), what="prediction row")
     assert 0.0 <= row["risk_score"] <= 1.0 and row["source"] == "LIVE_API"
-    assert row["persisted_at"] >= row["scored_at"] >= row["ingested_at"]
+    # persisted_at comes from PostgreSQL's clock, scored_at from the scorer's. When they run on
+    # different hosts (e.g. Docker's VM and Windows) the clocks can differ by a fraction of a
+    # millisecond, so the order is checked with a small allowance for that skew.
+    skew = timedelta(milliseconds=CLOCK_SKEW_MS)
+    assert row["persisted_at"] + skew >= row["scored_at"] and row["scored_at"] + skew >= row["ingested_at"]
     api_row = httpx.get(f"{API}/v1/transactions/{event['transaction_id']}", headers=KEY, timeout=10).json()
     assert api_row["risk_score"] == row["risk_score"] and api_row["risk_level"] == row["risk_level"]
 

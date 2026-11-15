@@ -1,0 +1,4 @@
+# Training extras, not needed by the services. XGBoost's Linux and Windows wheels include CUDA,
+# so `python ml/train.py --device cuda` uses an NVIDIA GPU without installing the CUDA toolkit.
+-r requirements.txt
+xgboost==3.4.1
