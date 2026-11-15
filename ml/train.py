@@ -150,6 +150,8 @@ def main() -> None:
     ap.add_argument("--device", choices=["cpu", "cuda"], default=os.environ.get("TRAIN_DEVICE", "cpu"),
                     help="where XGBoost trains (cuda = NVIDIA GPU; XGBoost's pip package includes CUDA). "
                          "Features, rules, logistic regression and random forest always use the CPU.")
+    ap.add_argument("--skip", default="", help="comma-separated comparison models to leave out, e.g. "
+                    "random_forest,logistic_regression (LightGBM is always trained: it is the model that is saved)")
     ap.add_argument("--lightgbm-device", choices=["cpu", "gpu", "cuda"], default="cpu",
                     help="gpu/cuda need a LightGBM built from source with GPU support; the pip build is CPU only")
     a = ap.parse_args()
@@ -193,6 +195,10 @@ def main() -> None:
             tree_method="hist", device=a.device, eval_metric="aucpr", random_state=0)
     elif a.device == "cuda":
         sys.exit("--device cuda trains XGBoost on the GPU, but xgboost is not installed")
+    skip = {m for m in a.skip.split(",") if m}
+    if unknown := skip - (set(models) - {"lightgbm"}):
+        sys.exit(f"--skip: cannot skip {sorted(unknown)}; choose from {sorted(set(models) - {'lightgbm'})}")
+    models = {k: v for k, v in models.items() if k not in skip}
     results, fitted, fit_seconds = {}, {}, {}
     for name, model in models.items():
         if model is None:
@@ -201,6 +207,10 @@ def main() -> None:
             t_fit = time.perf_counter()
             model.fit(X[tr], y[tr])
             fit_seconds[name] = round(time.perf_counter() - t_fit, 1)
+            if name == "xgboost" and a.device != "cpu":
+                # Trained on the GPU; the evaluation data is in CPU memory, so predict on the CPU
+                # instead of copying it over (XGBoost otherwise warns about mismatched devices).
+                model.set_params(device="cpu")
             fitted[name] = model
             score_fn = lambda df, m=model: m.predict_proba(df)[:, 1]
         p_val, p_test = score_fn(X[va]), score_fn(X[te])
