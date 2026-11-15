@@ -1,10 +1,10 @@
 {
   "pipeline_mode": "direct",
-  "post_to_dashboard_push_s": 0.234,
+  "post_to_dashboard_push_s": 0.457,
   "kafka_path": [
-    "demo.payments.transactions.v1[1]@15856",
-    "demo.payments.transactions.v1[1]@15856",
-    "demo.payments.scored.v1[3]@15219"
+    "demo.payments.transactions.v1[1]@61024",
+    "demo.payments.transactions.v1[1]@61024",
+    "demo.payments.scored.v1[1]@60940"
   ],
   "prediction": {
     "risk_score": 0.999974,
@@ -19,11 +19,11 @@
       "HIGH_RISK_TXN_TYPE"
     ],
     "model_version": "v0.2-synthetic",
-    "inference_ms": 2.615
+    "inference_ms": 3.13
   },
-  "risky_txn": "TXN_ACC_a7dcc6e25fa0",
+  "risky_txn": "TXN_ACC_e111c63eb653",
   "alert": {
-    "alert_id": 707,
+    "alert_id": 3143,
     "priority": 1,
     "trigger_types": [
       "RISK_SCORE",
@@ -39,44 +39,44 @@
   },
   "performance": {
     "window_minutes": 5,
-    "samples": 17996,
-    "throughput_tps": 112.16,
+    "samples": 3048,
+    "throughput_tps": 104.84,
     "pipeline_ms": {
-      "p50": 64234.615,
-      "p95": 184014.556,
-      "p99": 192432.793
+      "p50": 6575.231,
+      "p95": 30941.967,
+      "p99": 35243.082
     },
     "inference_ms": {
-      "p50": 0.24,
-      "p95": 0.418,
-      "p99": 2.454
+      "p50": 0.225,
+      "p95": 0.475,
+      "p99": 1.384
     },
     "feature_ms": {
-      "p50": 0.854,
-      "p95": 2.302,
-      "p99": 4.627
+      "p50": 0.831,
+      "p95": 2.406,
+      "p99": 4.47
     },
     "ingest_ms": {
-      "p50": 2.148,
-      "p95": 28.475,
-      "p99": 28.475,
+      "p50": 1.042,
+      "p95": 5.118,
+      "p99": 5.118,
       "samples": 12
     },
     "push_ms": {
-      "p50": 7.731,
-      "p95": 12.22,
-      "p99": 29.77,
+      "p50": 7.521,
+      "p95": 36.419,
+      "p99": 101.479,
       "samples": 2000
     },
-    "consumer_lag": 18,
+    "consumer_lag": 0,
     "spark_backlog": null,
-    "events_received": 95046,
-    "events_dead_lettered": 374,
-    "error_rate": 0.003935,
-    "measured_at": "2026-11-13T18:41:04.130961+00:00"
+    "events_received": 365497,
+    "events_dead_lettered": 965,
+    "error_rate": 0.00264,
+    "measured_at": "2026-11-15T20:27:52.994089+00:00"
   },
-  "seconds_to_show_disconnected": 6.2,
-  "seconds_to_recover_backlog": 8.8,
-  "run_at": "2026-11-13T18:41:23.939155+00:00",
+  "seconds_to_show_disconnected": 6.1,
+  "seconds_to_recover_backlog": 15.2,
+  "run_at": "2026-11-15T20:28:22.169501+00:00",
   "environment": "demo"
 }

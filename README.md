@@ -1,4 +1,4 @@
-# VYROX: real-time payment fraud detection (v0.2)
+# VYROX: real-time payment fraud detection (v0.4)
 
 Every transaction goes through one path: ingestion gateway, Kafka, Spark
 Structured Streaming, feature store, model, PostgreSQL, alert engine, and a
@@ -103,15 +103,80 @@ On a small machine set `PIPELINE_MODE=direct` in `.env` and start with
 topic and Spark is not in the scoring path (start it separately with
 `make spark` if you want the lake).
 
+Sign in to the dashboard as `admin` with the password from `ADMIN_PASSWORD` in `.env`
+(`vyrox-demo-admin` in the demo file). Add named accounts for other people under the Admin tab.
+
 Send something yourself:
 
 ```bash
 curl -X POST localhost:8000/v1/transactions -H 'X-API-Key: dev-key' -H 'Content-Type: application/json' -d '{
   "transaction_id":"TXN_MINE_1","event_time":"2026-11-13T12:00:00+00:00","account_id":"C1",
   "counterparty_id":"M1","txn_type":"TRANSFER","amount":98000,"old_balance_orig":98500,"old_balance_dest":0}'
-curl -X POST localhost:8000/v1/demo/scenario -H 'X-API-Key: dev-key' -H 'Content-Type: application/json' \
-  -d '{"scenario":"RAPID_BURST"}'        # also ACCOUNT_TAKEOVER, UNUSUAL_AMOUNT
 ```
+
+Fraud scenarios (`RAPID_BURST`, `ACCOUNT_TAKEOVER`, `UNUSUAL_AMOUNT`) are injected from the Ingest tab,
+which needs an administrator.
+
+## Documents for an evaluator
+
+| Document | What it answers |
+|---|---|
+| [docs/SECURITY.md](docs/SECURITY.md) | What protects access and data, and what is missing |
+| [docs/INTEGRATION.md](docs/INTEGRATION.md) | How to send transactions and read results |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Running it on a server: HTTPS, backups, recovery, capacity |
+| [docs/MODEL_CARD.md](docs/MODEL_CARD.md) | What the model is, what it was trained on, how far to trust it |
+
+## Sign-in, roles and the audit log
+
+| Caller | How it authenticates | What it may do |
+|---|---|---|
+| Viewer | username and password | read everything |
+| Analyst | username and password | read, and work alerts (assign, review, confirm, dismiss) |
+| Admin | username and password | everything: settings, imports, demo scenarios, people, audit log |
+| Machine | `X-API-Key` | send transactions, dry-run scores, read. Nothing else. |
+
+- Passwords are stored as salted scrypt hashes, at least 10 characters. Five failed sign-ins for one
+  username from one address lock that pair out for 15 minutes.
+- A sign-in returns a random session token valid for 8 hours. Only its SHA-256 digest is stored.
+  Deactivating a person, changing their role or resetting their password ends their sessions at once.
+- The browser holds the token for the life of the tab. No API key is built into the dashboard any more.
+- An alert change is recorded under the signed-in person's name; the request cannot choose the actor.
+- `audit_log` records every sign-in, failed sign-in, refused request, alert change, settings change
+  (with before and after values), import, demo scenario and change to a user. The API only appends to it.
+- The last active administrator cannot be demoted or deactivated.
+
+What this is not: there is no single sign-on and no multi-factor sign-in. Database users can still alter
+`audit_log`; making it tamper-evident needs restricted database roles or an external log store.
+
+## HTTPS
+
+```bash
+# in .env:  DASHBOARD_API_URL=      (empty: the dashboard calls its own origin)
+#           SITE_ADDRESS=localhost  (or a public host name for an automatic public certificate)
+docker compose --profile app --profile tls up -d --build      # then open https://localhost
+```
+
+A Caddy proxy serves the dashboard and API on one origin, redirects HTTP to HTTPS and adds HSTS, a
+content security policy and frame protection. `/metrics` is not published through it. Without this
+profile, tokens and passwords cross the network in plain HTTP, which is only acceptable on localhost.
+
+## Backups
+
+```bash
+docker compose --profile backup up -d                         # one archive every 24 h into ./backups
+docker compose run --rm --entrypoint sh backup /tools/restore.sh /backups/<file>.dump vyrox_restored
+```
+
+Archives are checksummed and kept 14 days. A restore verifies the checksum and only ever creates a new
+database. Tested: a restored copy had exactly the row counts of the live database. Copy the archives off
+the machine; they are not encrypted.
+
+## Model health
+
+The Performance tab compares the last 24 hours of live model inputs with the training data, feature by
+feature (Population Stability Index, also at `GET /v1/model/drift`). It reports that inputs have moved,
+not that the model is wrong. In the demo it reads "drifted" after a fraud scenario or a load test, because
+those change transaction velocity, which is the point of the check.
 
 ## Risk levels, decisions and alerts
 
@@ -160,10 +225,15 @@ and does not claim to be.
 
 ## Verified results
 
-Run on 13 Nov 2026 in a 4-core, 16 GB Linux sandbox. Kafka, Redis, PostgreSQL
-and Spark ran in Docker; the Python services ran on the host because image
-builds were blocked by that sandbox's network policy. The compose files for
-the Python services are therefore **untested in this exact form**.
+First run on 13 Nov 2026 in a 4-core, 16 GB Linux sandbox, with Kafka, Redis,
+PostgreSQL and Spark in Docker and the Python services on the host.
+
+On 15 Nov 2026 the images were built from this repository's Dockerfiles and the
+whole stack ran from `docker compose --profile app --profile tls up` (direct
+mode): all ten acceptance tests passed, and the browser check passed 17 of 17
+through the HTTPS proxy. The sandbox added only its own proxy certificate to
+the base images. The same ten acceptance tests also passed in Spark mode with
+Spark running in its container.
 
 ### The ten acceptance tests
 
@@ -201,8 +271,10 @@ windows of steady state, measured from stored rows
 | Stored to browser (clock offset removed) | 8 / 55 / 78 ms (one browser, 526 samples) | not re-measured |
 | REST request to Kafka acknowledgement | 1.2 / 4.2 / 4.2 ms (12 samples only) | not re-measured |
 
-Not measured: maximum throughput. 51 events per second is the generator's
-rate, not the system's limit.
+Maximum throughput, measured on 15 Nov 2026 with `tools/loadtest.py` (a burst of 30,000 events, then
+the backlog's drain rate): **251.7 events per second** on the same 4-core sandbox, direct mode, one
+scorer process (`reports/loadtest.json`). The scorer handles one event at a time with one database
+transaction each; that is the limit. It is a measurement of that machine, not a promise for another.
 
 Three things the measurements changed:
 
@@ -241,19 +313,23 @@ the training data.
 ## Known gaps
 
 - No real payment-gateway adapter and no live UPI, bank or card data.
-- The compose definitions of the Python services and the dashboard image were not built in the test sandbox.
 - The SSE hub is in process memory: run one API worker. More replicas need Redis pub/sub or one Kafka consumer per replica (already how events arrive).
 - Dashboard analytics run aggregate queries over the whole `predictions` table every 2 seconds. Fine for a demo, not for millions of rows.
 - The fan-in feature shares state across accounts; with several scorer replicas two senders to one destination scored at the same instant can miss each other.
 - The risk score is an uncalibrated model probability.
-- The dashboard API key is public by nature. Production needs analyst sign-in.
+- Sign-in is username and password only: no single sign-on and no multi-factor.
+- Single node: no high availability, no encryption at rest, no TLS between the internal services.
+- No certification or compliance work (ISO 27001, SOC 2, PCI DSS, RBI, DPDP) and no penetration test.
+- No synchronous approve-or-decline call: scoring is asynchronous, for review after submission.
+- Login lock-out and rate limits are held in the API process, so they reset on restart and are per replica.
 - "Spark backlog" on the dashboard is an approximation from topic offsets.
-- Not done from the original plan: PaySim and IEEE-CIS training, Airflow, dbt, MLflow registry, AWS deployment.
+- PaySim was trained on its first 500,000 rows only (see docs/MODEL_CARD.md); the full 6.3 million-row run is pending.
+- Not done from the original plan: IEEE-CIS training, Airflow, dbt, MLflow registry, AWS deployment.
 
 ## Tests
 
 ```bash
-make test lint                 # 50 unit tests: feature parity, rules, tiers, gateway, webhook signature, imports
+make test lint                 # 60 unit tests: feature parity, rules, tiers, gateway, webhook signature, imports
 make acceptance                # the ten acceptance tests; needs the stack running
 node tests/acceptance/browser_check.js docs/screenshots
 ```

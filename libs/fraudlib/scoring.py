@@ -49,6 +49,7 @@ class Scorer:
     def __init__(self, model_dir: str | Path | None):
         self.booster = None
         self.model_version = "rules-only"
+        self.reference = None   # training feature distributions, for drift monitoring
         if model_dir:
             meta_path = Path(model_dir) / "model_meta.json"
             if meta_path.exists():
@@ -59,6 +60,9 @@ class Scorer:
                     raise ValueError("Model was trained on different features; retrain it (make data train).")
                 self.booster = lgb.Booster(model_file=str(Path(model_dir) / meta["model_file"]))
                 self.model_version = meta["model_version"]
+                ref_path = Path(model_dir) / "reference.json"
+                if ref_path.exists():
+                    self.reference = json.loads(ref_path.read_text())
 
     def _model_probability(self, features: dict[str, float]) -> float:
         # One row, one thread: LightGBM's thread pool costs far more than it

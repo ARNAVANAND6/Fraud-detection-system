@@ -1,12 +1,19 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Alert, AlertDetail, AlertStatus, LEVELS, Pct, Policy, RiskLevel, SOURCE_LABEL, Source, Stats, Txn, TxnDetail, api,
+  Alert, AlertDetail, AlertStatus, AuditRow, Drift, DriftStatus, LEVELS, Me, Pct, Policy, RiskLevel, Role, SOURCE_LABEL, Source, Stats, Txn,
+  TxnDetail, User, api, session,
 } from "./api";
 import { LEVEL_COLOR, LEVEL_ICON, MinuteSeries, RiskDistribution } from "./charts";
 import { Live, useLive } from "./live";
 import { Scene3D } from "./Scene3D";
 
-type Tab = "overview" | "alerts" | "performance" | "ingest" | "settings";
+type Tab = "overview" | "alerts" | "performance" | "ingest" | "settings" | "admin";
+// What each role sees. The server enforces the same rules; this only hides what would be refused.
+const TABS: Record<Role, Tab[]> = {
+  VIEWER: ["overview", "alerts", "performance"],
+  ANALYST: ["overview", "alerts", "performance"],
+  ADMIN: ["overview", "alerts", "performance", "ingest", "settings", "admin"],
+};
 type Health = "live" | "idle" | "delayed" | "disconnected" | "offline" | "connecting";
 
 const inr = (n: number) => "₹" + Number(n).toLocaleString("en-IN", { maximumFractionDigits: 0 });
@@ -62,6 +69,47 @@ function Chips({ items }: { items: string[] }) {
 }
 
 export default function App() {
+  const [me, setMe] = useState<Me | null>(null);
+  const [checking, setChecking] = useState(session.has());
+  useEffect(() => {
+    if (session.has()) api.me().then(setMe).catch(() => undefined).finally(() => setChecking(false));
+    return session.onExpired(() => setMe(null));
+  }, []);
+  if (checking) return <div className="empty">Checking your session.</div>;
+  if (!me) return <SignIn onSignedIn={setMe} />;
+  return <Console me={me} onSignOut={() => { api.logout().catch(() => undefined).finally(() => setMe(null)); }} />;
+}
+
+function SignIn({ onSignedIn }: { onSignedIn: (me: Me) => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true); setError("");
+    try { onSignedIn(await api.login(username, password)); }
+    catch (err) {
+      const m = (err as Error).message;
+      setError(m.startsWith("401") ? "Wrong username or password." : m.startsWith("429") ? "Too many failed attempts. Try again in 15 minutes."
+        : m.includes("Failed to fetch") ? "Cannot reach the VYROX server." : m);
+    } finally { setBusy(false); }
+  };
+  return (
+    <div className="signin">
+      <form className="panel signin-card" onSubmit={submit} data-testid="signin">
+        <div className="brand">VYROX</div>
+        <p className="muted">Sign in to the fraud operations console.</p>
+        <label>Username<input autoFocus autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} /></label>
+        <label>Password<input type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+        {error && <div className="error" role="alert">{error}</div>}
+        <button className="on" type="submit" disabled={busy || !username || !password}>{busy ? "Signing in" : "Sign in"}</button>
+      </form>
+    </div>
+  );
+}
+
+function Console({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const [tab, setTab] = useState<Tab>("overview");
   const [source, setSource] = useState<Source | null>(null);
   const seed = useCallback(() => api.recent(500, null), []);
@@ -92,7 +140,7 @@ export default function App() {
           {env === "demo" ? "DEMO ENVIRONMENT · simulated data" : env === "production" ? "PRODUCTION" : "ENVIRONMENT UNKNOWN"}
         </div>
         <nav className="tabs">
-          {(["overview", "alerts", "performance", "ingest", "settings"] as Tab[]).map((t) => (
+          {TABS[me.role].map((t) => (
             <button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>
               {t === "alerts" && live.stats ? `Alerts (${live.stats.alerts.open} open)` : t[0].toUpperCase() + t.slice(1)}
             </button>
@@ -105,6 +153,10 @@ export default function App() {
           </select>
         </label>
         <div className={`pill pill-${h.state}`} data-testid="stream-pill"><span>{HEALTH_ICON[h.state]}</span> {h.title}</div>
+        <div className="who" data-testid="who" title={`Signed in as ${me.username}`}>
+          <b>{me.username}</b> <span className="muted">{me.role.toLowerCase()}</span>
+          <button onClick={onSignOut}>Sign out</button>
+        </div>
       </header>
 
       <section className="statusbar" data-testid="statusbar">
@@ -128,10 +180,11 @@ export default function App() {
 
       <main className={h.state === "live" ? "" : "stale"}>
         {tab === "overview" && <Overview stats={stats} feed={feed} live={live} source={source} now={now} onOpen={setOpenTxn} isLive={h.state === "live"} />}
-        {tab === "alerts" && <Alerts live={live} now={now} onOpenTxn={setOpenTxn} />}
+        {tab === "alerts" && <Alerts live={live} now={now} onOpenTxn={setOpenTxn} me={me} />}
         {tab === "performance" && <PerformanceTab live={live} />}
         {tab === "ingest" && <Ingest env={env} />}
         {tab === "settings" && <Settings />}
+        {tab === "admin" && <Admin me={me} />}
       </main>
       {openTxn && <TxnDrawer id={openTxn} onClose={() => setOpenTxn(null)} />}
       <footer>
@@ -266,7 +319,8 @@ const NEXT: Record<AlertStatus, AlertStatus[]> = {
   CONFIRMED_FRAUD: [], FALSE_POSITIVE: [],
 };
 
-function Alerts({ live, now, onOpenTxn }: { live: Live; now: number; onOpenTxn: (id: string) => void }) {
+function Alerts({ live, now, onOpenTxn, me }: { live: Live; now: number; onOpenTxn: (id: string) => void; me: Me }) {
+  const canWork = me.role !== "VIEWER";
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [filter, setFilter] = useState<"ACTIVE" | "ALL">("ACTIVE");
   const [selected, setSelected] = useState<number | null>(null);
@@ -324,10 +378,12 @@ function Alerts({ live, now, onOpenTxn }: { live: Live; now: number; onOpenTxn: 
             <p className="big mono">{detail.account_id}</p>
             <p>{detail.status.replace("_", " ")} · assigned to {detail.assigned_to ?? "nobody"} · {detail.event_count} transactions · {inr(detail.total_amount)}</p>
             <p><Chips items={detail.reason_codes} /></p>
-            <div className="actions">
-              {NEXT[detail.status].map((s) => <button key={s} onClick={() => act(detail.alert_id, { status: s })}>{s === "OPEN" ? "Reopen" : s.replace("_", " ").toLowerCase()}</button>)}
-              <button onClick={() => act(detail.alert_id, { assigned_to: "dashboard-user" })}>Assign to me</button>
-            </div>
+            {canWork ? (
+              <div className="actions">
+                {NEXT[detail.status].map((s) => <button key={s} onClick={() => act(detail.alert_id, { status: s })}>{s === "OPEN" ? "Reopen" : s.replace("_", " ").toLowerCase()}</button>)}
+                <button onClick={() => act(detail.alert_id, { assigned_to: me.username })}>Assign to me</button>
+              </div>
+            ) : <p className="muted">Your role can view alerts but not change them.</p>}
             <h4>Transactions in this alert</h4>
             <table className="compact">
               <tbody>{detail.transactions.map((t) => (
@@ -385,7 +441,57 @@ function PerformanceTab({ live }: { live: Live }) {
           {live.status?.pipeline_mode === "spark" && " In this mode every event waits for a Spark micro-batch before scoring, which dominates end-to-end latency."}
         </p>
       </div>
+      <ModelHealth />
     </>
+  );
+}
+
+const DRIFT_TEXT: Record<DriftStatus, string> = {
+  STABLE: "Stable", WATCH: "Watch", DRIFTED: "Drifted", NEEDS_24H: "Needs 24 h of traffic",
+  NOT_ENOUGH_DATA: "Not enough data", NO_REFERENCE: "No reference",
+};
+
+function ModelHealth() {
+  const [d, setD] = useState<Drift | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    let stop = false;
+    const load = () => api.drift().then((r) => { if (!stop) { setD(r); setErr(null); } })
+      .catch((e) => { if (!stop) setErr((e as Error).message); });
+    load();
+    const t = setInterval(load, 60_000);
+    return () => { stop = true; clearInterval(t); };
+  }, []);
+  return (
+    <div className="panel" data-testid="model-health">
+      <h3>Model health <span className="muted">live inputs compared with the data the model was trained on</span></h3>
+      {err && <p className="note">Could not load the comparison: {err}</p>}
+      {!d && !err && <div className="empty">Loading.</div>}
+      {d?.status === "NO_REFERENCE" && <div className="empty">Model {d.model_version} has no training reference, so drift cannot be measured. Run ml/build_reference.py for it.</div>}
+      {d?.status === "NOT_ENOUGH_DATA" && <div className="empty">Only {num(d.rows ?? 0)} live transactions in the last 24 hours. At least {num(d.min_rows ?? 0)} are needed for a comparison.</div>}
+      {d && d.features.length > 0 && (
+        <>
+          <p className="note">
+            Overall: <span className={`drift ${d.status}`}>{DRIFT_TEXT[d.status]}</span>. Model {d.model_version}, {num(d.rows ?? 0)} live
+            transactions over {(d.span_hours ?? 0).toFixed(1)} h against {num(d.reference_rows ?? 0)} training rows. Measured at {clock(d.measured_at)}.
+          </p>
+          <table>
+            <thead><tr><th>Model input</th><th className="r">PSI</th><th>Reading</th></tr></thead>
+            <tbody>
+              {d.features.map((f) => (
+                <tr key={f.feature}><td>{f.feature}</td><td className="r">{f.psi.toFixed(3)}</td>
+                  <td><span className={`drift ${f.status}`}>{DRIFT_TEXT[f.status]}</span></td></tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="note">
+            PSI (population stability index) measures how far a model input has moved from training: above {d.watch_above} is worth
+            watching, above {d.drifted_above} has drifted. Drift means the inputs changed. It does not by itself mean the model is
+            wrong; confirmed labels decide that. Training data: {d.reference_data ?? "unknown"}.
+          </p>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -487,6 +593,80 @@ function Settings() {
         Response-time targets in minutes by priority: {LEVELS.map((_, i) => `P${i + 1} ${policy.alerts.sla_minutes[String(i + 1)]}`).join(", ")}.
       </p>
       <div className="actions"><button className="on" onClick={save}>Save</button> <span>{msg}</span></div>
+    </div>
+  );
+}
+
+const ROLES: Role[] = ["VIEWER", "ANALYST", "ADMIN"];
+
+function Admin({ me }: { me: Me }) {
+  const [users, setUsers] = useState<User[]>([]);
+  const [audit, setAudit] = useState<AuditRow[]>([]);
+  const [msg, setMsg] = useState("");
+  const [form, setForm] = useState({ username: "", password: "", role: "ANALYST" as Role });
+  const load = useCallback(() => {
+    Promise.all([api.users(), api.audit()]).then(([u, a]) => { setUsers(u); setAudit(a); }).catch((e) => setMsg(String(e.message)));
+  }, []);
+  useEffect(load, [load]);
+  const run = async (what: string, fn: () => Promise<unknown>) => {
+    try { await fn(); setMsg(`${what}: done.`); } catch (e) { setMsg(`${what}: ${(e as Error).message}`); }
+    load();
+  };
+  return (
+    <div className="grid2">
+      <div className="panel">
+        <h3>People <span className="muted">who can sign in, and what they may do</span></h3>
+        {msg && <div className="notice" role="status">{msg}</div>}
+        <table data-testid="users">
+          <thead><tr><th>Username</th><th>Role</th><th>Status</th><th></th></tr></thead>
+          <tbody>{users.map((u) => (
+            <tr key={u.username}>
+              <td className="mono">{u.username}{u.username === me.username && <span className="muted"> (you)</span>}</td>
+              <td>
+                <select value={u.role} aria-label={`Role of ${u.username}`}
+                        onChange={(e) => run(`Role of ${u.username}`, () => api.changeUser(u.username, { role: e.target.value as Role }))}>
+                  {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+                </select>
+              </td>
+              <td>{u.active ? "Active" : "Deactivated"}</td>
+              <td className="r">
+                <button onClick={() => run(`${u.active ? "Deactivate" : "Reactivate"} ${u.username}`, () => api.changeUser(u.username, { active: !u.active }))}>
+                  {u.active ? "Deactivate" : "Reactivate"}
+                </button>
+              </td>
+            </tr>
+          ))}</tbody>
+        </table>
+        <h4>Add a person</h4>
+        <form className="form" onSubmit={(e) => { e.preventDefault(); run(`Add ${form.username}`, async () => {
+          await api.createUser(form.username, form.password, form.role); setForm({ username: "", password: "", role: "ANALYST" }); }); }}>
+          <label>Username<input value={form.username} autoComplete="off" onChange={(e) => setForm({ ...form, username: e.target.value })} /></label>
+          <label>Initial password (10 or more characters)
+            <input type="password" autoComplete="new-password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></label>
+          <label>Role
+            <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as Role })}>
+              {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+            </select></label>
+          <div className="actions"><button className="on" type="submit" disabled={!form.username || form.password.length < 10}>Add person</button></div>
+        </form>
+        <p className="muted">Viewer: read only. Analyst: can also work alerts. Admin: can also change settings, import data and manage people.
+          Changing a role or deactivating someone signs them out everywhere.</p>
+      </div>
+      <div className="panel">
+        <div className="panel-head"><h3>Audit log <span className="muted">latest {audit.length} entries, newest first</span></h3>
+          <button onClick={load}>Refresh</button></div>
+        <table className="compact" data-testid="audit">
+          <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
+          <tbody>{audit.map((a) => (
+            <tr key={a.id}>
+              <td>{new Date(a.at).toLocaleString()}</td><td className="mono">{a.actor}</td><td>{a.action.replace(/_/g, " ").toLowerCase()}</td>
+              <td className="mono">{a.target ?? ""}</td>
+              <td className="small mono">{Object.keys(a.detail).length ? JSON.stringify(a.detail) : ""}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+        {audit.length === 0 && <div className="empty">No entries yet.</div>}
+      </div>
     </div>
   );
 }

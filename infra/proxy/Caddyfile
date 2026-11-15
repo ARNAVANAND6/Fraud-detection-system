@@ -1,0 +1,36 @@
+# TLS in front of VYROX. One origin serves the dashboard and the API, so the
+# browser never talks plain HTTP and no cross-origin rules are needed.
+#
+# SITE_ADDRESS=localhost (default): Caddy issues a certificate from its own
+#   local authority. Browsers warn until that authority is trusted on the machine.
+# SITE_ADDRESS=risk.example.com: Caddy obtains and renews a public certificate
+#   automatically. Ports 80 and 443 must be reachable from the internet.
+{$SITE_ADDRESS:localhost} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+		-Server
+	}
+
+	@api path /v1/* /health/* /docs /openapi.json
+	handle @api {
+		reverse_proxy {$API_UPSTREAM:api:8000} {
+			# The live stream is Server-Sent Events: pass every chunk through at once.
+			flush_interval -1
+		}
+	}
+
+	# Prometheus metrics stay inside the network; they are not published.
+	handle /metrics {
+		respond 404
+	}
+
+	handle {
+		reverse_proxy {$DASHBOARD_UPSTREAM:dashboard:80}
+	}
+}

@@ -10,3 +10,4 @@ models/*
 logs/
 .env.production
 *.tsbuildinfo
+backups/

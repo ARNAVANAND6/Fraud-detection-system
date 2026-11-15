@@ -1,10 +1,10 @@
 {
   "pipeline_mode": "spark",
-  "post_to_dashboard_push_s": 0.638,
+  "post_to_dashboard_push_s": 0.128,
   "kafka_path": [
-    "demo.payments.transactions.v1[4]@10089",
-    "demo.payments.transactions.validated.v1[5]@10539",
-    "demo.payments.scored.v1[0]@9790"
+    "demo.payments.transactions.v1[4]@71080",
+    "demo.payments.transactions.validated.v1[0]@94291",
+    "demo.payments.scored.v1[0]@73793"
   ],
   "prediction": {
     "risk_score": 0.999974,
@@ -19,11 +19,11 @@
       "HIGH_RISK_TXN_TYPE"
     ],
     "model_version": "v0.2-synthetic",
-    "inference_ms": 3.198
+    "inference_ms": 2.32
   },
-  "risky_txn": "TXN_ACC_b758c74b64b9",
+  "risky_txn": "TXN_ACC_f6a0b46880cf",
   "alert": {
-    "alert_id": 454,
+    "alert_id": 3700,
     "priority": 1,
     "trigger_types": [
       "RISK_SCORE",
@@ -39,44 +39,44 @@
   },
   "performance": {
     "window_minutes": 5,
-    "samples": 7161,
-    "throughput_tps": 35.96,
+    "samples": 45431,
+    "throughput_tps": 179.07,
     "pipeline_ms": {
-      "p50": 988.649,
-      "p95": 2060.086,
-      "p99": 2866.525
+      "p50": 334831.494,
+      "p95": 698603.349,
+      "p99": 744759.576
     },
     "inference_ms": {
-      "p50": 0.237,
-      "p95": 0.43,
-      "p99": 2.57
+      "p50": 0.192,
+      "p95": 0.34,
+      "p99": 2.008
     },
     "feature_ms": {
-      "p50": 0.799,
-      "p95": 2.248,
-      "p99": 4.979
+      "p50": 0.708,
+      "p95": 2.17,
+      "p99": 4.628
     },
     "ingest_ms": {
-      "p50": 1.24,
-      "p95": 4.212,
-      "p99": 4.212,
+      "p50": 1.012,
+      "p95": 6.998,
+      "p99": 6.998,
       "samples": 12
     },
     "push_ms": {
-      "p50": 7.701,
-      "p95": 13.373,
-      "p99": 33.359,
+      "p50": 6.866,
+      "p95": 13.879,
+      "p99": 23.92,
       "samples": 2000
     },
-    "consumer_lag": 14,
-    "spark_backlog": 34,
-    "events_received": 62493,
-    "events_dead_lettered": 128,
-    "error_rate": 0.002048,
-    "measured_at": "2026-11-13T18:30:34.261123+00:00"
+    "consumer_lag": 0,
+    "spark_backlog": 0,
+    "events_received": 436273,
+    "events_dead_lettered": 1910,
+    "error_rate": 0.004378,
+    "measured_at": "2026-11-15T20:51:10.253351+00:00"
   },
-  "seconds_to_show_disconnected": 6.5,
-  "seconds_to_recover_backlog": 7.6,
-  "run_at": "2026-11-13T18:30:53.861011+00:00",
+  "seconds_to_show_disconnected": 6.2,
+  "seconds_to_recover_backlog": 22.1,
+  "run_at": "2026-11-15T20:51:45.388562+00:00",
   "environment": "demo"
 }

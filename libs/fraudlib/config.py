@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 
 DEMO_WEBHOOK_SECRET = "demo-webhook-secret"
 DEMO_API_KEY = "dev-key"
+DEMO_ADMIN_USERNAME = "admin"
+DEMO_ADMIN_PASSWORD = "vyrox-demo-admin"  # demo only; production refuses to start with it
 
 
 def _env(name: str, default: str) -> str:
@@ -33,6 +35,9 @@ class Settings:
         default_factory=lambda: tuple(k for k in _env("API_KEYS", DEMO_API_KEY).split(",") if k)
     )
     webhook_secret: str = field(default_factory=lambda: _env("WEBHOOK_SECRET", ""))
+    # First administrator, created at start-up if no such user exists yet.
+    admin_username: str = field(default_factory=lambda: _env("ADMIN_USERNAME", DEMO_ADMIN_USERNAME).lower())
+    admin_password: str = field(default_factory=lambda: _env("ADMIN_PASSWORD", DEMO_ADMIN_PASSWORD))
     rate_limit_per_minute: int = field(default_factory=lambda: int(_env("RATE_LIMIT_PER_MINUTE", "6000")))
     cors_origins: tuple[str, ...] = field(
         default_factory=lambda: tuple(_env("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(","))
@@ -86,6 +91,8 @@ class Settings:
             problems.append("API_KEYS still contains the demo key")
         if self.webhook_secret in ("", DEMO_WEBHOOK_SECRET):
             problems.append("WEBHOOK_SECRET is unset or the demo secret")
+        if self.admin_password == DEMO_ADMIN_PASSWORD:
+            problems.append("ADMIN_PASSWORD is unset or the demo password")
         if problems:
             raise RuntimeError("Unsafe production config: " + "; ".join(problems))
 

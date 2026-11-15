@@ -32,6 +32,8 @@ from fraudlib.config import get_settings
 from fraudlib.schemas import TransactionEvent, TxnType
 
 log = logging.getLogger("generator")
+# Fall further behind than this and the generator resumes from now instead of catching up.
+MAX_LAG_S = 1.0
 
 REGIONS = ["NORTH", "SOUTH", "EAST", "WEST", "CENTRAL"]  # synthetic regions only
 NORMAL_TYPE_WEIGHTS = {
@@ -279,6 +281,12 @@ def run_kafka(sim: Simulator, rate: float, max_events: int | None) -> None:
         delay = next_t - time.perf_counter()
         if delay > 0:
             time.sleep(delay)
+        elif delay < -MAX_LAG_S:
+            # The process was paused (a laptop sleeping, a stopped container). Catching up
+            # would send every "missed" tick at once, all stamped now: an artificial burst
+            # that makes every account look like it pays hundreds of times an hour.
+            log.warning("generator fell %.0f s behind schedule; resuming at --rate from now", -delay)
+            next_t = time.perf_counter()
         if time.time() - last_report > 10:
             log.info("progress %s", json.dumps(totals))
             last_report = time.time()
