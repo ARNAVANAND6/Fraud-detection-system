@@ -82,6 +82,18 @@ models. `python ml/train.py --device cuda` (or `TRAIN_DEVICE=cuda`) trains it on
 package includes CUDA, so only the graphics driver is needed. The pip build of LightGBM is CPU only.
 Each model's measured fit time is stored in `model_meta.json` under `fit_seconds`.
 
+Measured on the author's laptop (NVIDIA RTX 5060 Laptop GPU, 8 GB), all 6.3 million PaySim rows,
+`--skip random_forest,logistic_regression`, 15 Nov 2026:
+
+| | XGBoost fit | Whole run | Peak memory | XGBoost test PR-AUC |
+|---|---|---|---|---|
+| CPU | 56.2 s | 172.3 s | 1.8 GB | 0.9820 |
+| GPU (`--device cuda`) | 9.1 s | 124.3 s | 1.8 GB | 0.9819 |
+
+The rest of the run is reading the CSV, building features and LightGBM (26 s), which stay on the CPU. On
+500,000 rows the GPU saved under 2 seconds. The random forest is what made the earlier full run peak at
+6.8 GB; skip it when memory is short.
+
 Only model fitting moves to the GPU. Building the features, the other models and live scoring stay on the CPU;
 live scoring handles one transaction at a time in well under a millisecond, which a GPU would not improve.
 The scorer still serves LightGBM models only.
