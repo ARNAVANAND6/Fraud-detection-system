@@ -313,7 +313,7 @@ the training data.
 
 ## Known gaps
 
-- No real payment-gateway adapter and no live UPI, bank or card data.
+- Razorpay and Stripe webhook adapters are built and tested with documented payloads, not with a live account. No UPI switch, bank or card-network feed. Gateway payments carry no balances, so they are scored mainly by the rules (docs/INTEGRATION.md).
 - Each API process runs one worker. For more capacity or failover run more API processes (docker-compose.ha.yml); each gets live events from Kafka itself.
 - Dashboard analytics run aggregate queries over the whole `predictions` table every 2 seconds. Fine for a demo, not for millions of rows.
 - The fan-in feature shares state across accounts; with several scorer replicas two senders to one destination scored at the same instant can miss each other.

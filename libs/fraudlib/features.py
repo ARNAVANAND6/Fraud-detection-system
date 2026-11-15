@@ -76,16 +76,17 @@ def compute_features(
     avg_24h = sum(h.amount for h in prior) / count_24h if count_24h else 0.0
     last = max((h.ts_ms for h in prior), default=None)
 
-    bal = event.old_balance_orig
+    bal, dest = event.old_balance_orig, event.old_balance_dest
+    nan = float("nan")
     return {
         "amount": event.amount,
         "log_amount": math.log1p(event.amount),
         "is_transfer": float(event.txn_type == TxnType.TRANSFER),
         "is_cash_out": float(event.txn_type == TxnType.CASH_OUT),
         "hour_of_day": float(event.event_time.hour),
-        "amount_to_balance": event.amount / (bal + 1.0),
-        "drains_balance": float(bal > 0 and event.amount >= 0.95 * bal),
-        "dest_balance_zero": float(event.old_balance_dest == 0),
+        "amount_to_balance": nan if bal is None else event.amount / (bal + 1.0),
+        "drains_balance": nan if bal is None else float(bal > 0 and event.amount >= 0.95 * bal),
+        "dest_balance_zero": nan if dest is None else float(dest == 0),
         "count_60s": float(len(w60)),
         "count_1h": float(len(w1h)),
         "count_24h": float(count_24h),

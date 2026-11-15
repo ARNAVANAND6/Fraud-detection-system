@@ -31,7 +31,7 @@ from fraudlib.scoring import Scorer
 from prometheus_client import start_http_server
 from pydantic import ValidationError
 
-from . import nodes
+from . import nodes, notify
 from .metrics import ALERTS, EVENTS, FEATURE_SECONDS, INFERENCE_SECONDS, PIPELINE_SECONDS, RETRIES
 from .repository import Repository, connect_with_retry
 
@@ -165,6 +165,9 @@ class ScoringWorker:
             kind = "CREATED" if alert["is_new"] else "EVENT_ATTACHED"
             ALERTS.labels(kind.lower()).inc()
             self.producer.produce(self.s.topic_scored, value=jsonlog.dumps(alert_event(alert, kind)))
+            if alert["is_new"] and alert["priority"] == 1:
+                notify.send_capped(self.redis, self.s.alert_webhook_url,
+                                   notify.fraud_alert_text(alert, self.s.dashboard_url))
 
     def process_with_retry(self, msg) -> None:
         attempt, backoff = 0, 1.0

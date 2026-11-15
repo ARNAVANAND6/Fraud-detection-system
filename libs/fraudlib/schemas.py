@@ -48,8 +48,10 @@ class TransactionEvent(BaseModel):
     counterparty_id: str = Field(min_length=1, max_length=64)
     txn_type: TxnType
     amount: float = Field(gt=0, lt=1e9)
-    old_balance_orig: float = Field(ge=0)
-    old_balance_dest: float = Field(ge=0)
+    # None = not known. Payment gateways do not see balances; the balance features are then
+    # missing (NaN) and the balance rules do not fire, instead of reading an unknown as zero.
+    old_balance_orig: float | None = Field(default=None, ge=0)
+    old_balance_dest: float | None = Field(default=None, ge=0)
     channel: str = Field(default="APP", max_length=16)
     region: str = Field(default="UNKNOWN", max_length=32)  # synthetic, not real geography
     device_id: str | None = Field(default=None, max_length=64)

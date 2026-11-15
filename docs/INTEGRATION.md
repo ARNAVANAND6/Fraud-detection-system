@@ -3,9 +3,9 @@
 How a payment system sends transactions to VYROX and reads the result. The
 interactive reference for every endpoint is at `/docs` on the API.
 
-VYROX ships no adapter for any bank, UPI switch, card network or payment
-gateway. The sender must map its own records to the schema below, and must be
-authorised to share that data.
+VYROX has webhook adapters for two payment gateways, Razorpay and Stripe (section 2a). It has none for a
+bank, UPI switch or card network: those senders map their own records to the schema below. Every sender must
+be authorised to share the data.
 
 ## 1. The transaction
 
@@ -32,7 +32,7 @@ authorised to share that data.
 | `account_id`, `counterparty_id` | Required, up to 64 characters. Send stable tokens, not raw account numbers |
 | `txn_type` | `PAYMENT`, `TRANSFER`, `CASH_OUT`, `CASH_IN` or `DEBIT` |
 | `amount` | Greater than 0 |
-| `old_balance_orig`, `old_balance_dest` | Balances before the transaction, 0 or more |
+| `old_balance_orig`, `old_balance_dest` | Balances before the transaction, 0 or more. Leave them out if you do not know them; do not send 0 for "unknown" (see 2a) |
 | `channel`, `region`, `device_id` | Optional |
 
 Unknown fields are rejected with 422, so a mapping mistake fails loudly.
@@ -70,6 +70,46 @@ urllib.request.urlopen(urllib.request.Request(
     headers={"Content-Type": "application/json", "X-Vyrox-Timestamp": ts, "X-Vyrox-Signature": sig}))
 ```
 
+## 2a. Payment-gateway connectors
+
+| Gateway | Webhook URL to register | Secret setting | Events scored |
+|---|---|---|---|
+| Razorpay | `https://<your host>/v1/connectors/razorpay/webhook` | `RAZORPAY_WEBHOOK_SECRET` | `payment.authorized`, `payment.captured` |
+| Stripe | `https://<your host>/v1/connectors/stripe/webhook` | `STRIPE_WEBHOOK_SECRET` (`whsec_...`) | `charge.succeeded`, `charge.captured` |
+
+1. In the gateway's dashboard, create a webhook to the URL above for those events. It shows a signing secret.
+2. Put that secret in `.env` and restart the API. The connector is off while its secret is empty.
+3. `GET /v1/connectors` (and the dashboard's Integrations page) shows each connector: on or off, last event,
+   events in the last 24 hours and the last error, such as a bad signature.
+
+What the adapters do:
+
+- Check the signature on the raw body: Razorpay's `X-Razorpay-Signature` (HMAC-SHA256 of the body), Stripe's
+  `Stripe-Signature` (HMAC-SHA256 of `<timestamp>.<body>`, refused outside 5 minutes). A bad signature is `400`.
+- Score only payments in `CONNECTOR_CURRENCIES` (default `INR`; amounts are not converted). Other events,
+  refunds and other currencies answer `200 ignored`, so the gateway does not retry them.
+- Use the payment id as `transaction_id`. Razorpay sends `authorized` and then `captured` for one payment; the
+  second is recognised as a duplicate.
+- Payer: the gateway's customer id, else UPI address, card, phone or e-mail, stored only as a keyed digest
+  (HMAC with `SECRET_KEY`). Changing `SECRET_KEY` changes every payer's digest and so resets their history.
+- Merchant (`counterparty_id`): the Razorpay `account_id` or Stripe connected account.
+- No balances and no device: gateways do not send them.
+
+**What that means for the score.** The deployed model was trained with balances and leans on them. Sending 0
+for an unknown balance made every payment over about Rs 25,000 score as critical in a check on the deployed
+model. Unknown balances are therefore left out: the three balance features are missing, the balance rules do
+not fire, and because the model without balances scores almost everything near zero, the rules set the floor
+for these events. Measured on the running stack: a 5th payment of Rs 9,000 from one UPI address within
+7 seconds scored 0.35 (MEDIUM, rapid transactions); a first Rs 95,000 payment scored 0.20 (LOW, new
+counterparty, high amount). In effect gateway payments are scored by the rules plus velocity. A useful model
+for them needs training on the merchant's own gateway history with confirmed fraud labels.
+
+Razorpay's `created_at` is in whole seconds, so payments from one payer in the same second do not count
+towards each other's velocity.
+
+Tested with payloads in each gateway's documented format and signing scheme, through the running stack. Not
+tested against a live Razorpay or Stripe account: that needs the merchant's own account.
+
 ## 3. Getting the result
 
 | Need | Call |
@@ -93,6 +133,16 @@ The risk score is a model estimate for a reviewer. It is not a banking or regula
 
 Confirmed and dismissed alerts become labels (`labels` table) with who decided and when. These are the data for
 retraining and for measuring real precision. No separate chargeback feed is built.
+
+## 4a. Operational alerts
+
+Set `ALERT_WEBHOOK_URL` to a Slack (or Teams, or any) incoming-webhook URL. VYROX posts `{"text": ...}` for:
+
+- a new priority-1 fraud alert: its id, score and reason codes, never the account or amount. At most 10 an
+  hour; the 11th message says the rest are in the queue.
+- an API or scorer node that stopped reporting, and the stream disconnecting: once per 30 minutes per problem,
+  however many API replicas notice it.
+- a failed backup (the `backup` service).
 
 ## 5. Limits to plan around
 

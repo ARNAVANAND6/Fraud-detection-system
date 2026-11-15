@@ -303,6 +303,8 @@ def require(*allowed: str, allow_limited: bool = False):
 
 can_read = require(*ROLES, SERVICE)
 can_ingest = require("ADMIN", SERVICE)
+# A dry-run score changes nothing, so analysts may use it to check a transaction by hand.
+can_dry_run = require("ANALYST", "ADMIN", SERVICE)
 can_work_alerts = require("ANALYST", "ADMIN")
 admin_only = require("ADMIN")
 signed_in = require(*ROLES)

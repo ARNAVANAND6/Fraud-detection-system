@@ -135,8 +135,9 @@ several scorers, two senders paying the same destination at the same instant can
   `docker compose --profile obs up -d` starts Prometheus and Grafana.
 - JSON logs on stdout of every service.
 - The dashboard's Performance tab: measured latency, consumer lag, error rate and model drift.
-- No alerting to e-mail or chat is configured. Add Prometheus alert rules for consumer lag, a missing scorer
-  heartbeat and failed backups ("BACKUP FAILED" in the backup container's log).
+- `ALERT_WEBHOOK_URL` posts to Slack, Teams or similar when a node stops, the stream disconnects, a backup
+  fails or a priority-1 fraud alert is raised (docs/INTEGRATION.md, 4a). Tested against a local receiver, not a
+  real Slack workspace. No e-mail or paging integration; consumer lag has no alert yet.
 
 ## Upgrades
 

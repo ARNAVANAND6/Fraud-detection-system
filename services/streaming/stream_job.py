@@ -107,8 +107,8 @@ def parse(raw: DataFrame) -> DataFrame:
         .when(F.col("account_id").isNull() | F.col("counterparty_id").isNull(), F.lit("MISSING_PARTY"))
         .when(~F.col("txn_type").isin(TXN_TYPES), F.lit("BAD_TXN_TYPE"))
         .when(F.col("amount").isNull() | (F.col("amount") <= 0), F.lit("BAD_AMOUNT"))
-        .when(F.col("old_balance_orig").isNull() | F.col("old_balance_dest").isNull()
-              | (F.col("old_balance_orig") < 0) | (F.col("old_balance_dest") < 0), F.lit("BAD_BALANCE"))
+        # A missing balance means "not known" (payment gateways); only a negative one is invalid.
+        .when((F.col("old_balance_orig") < 0) | (F.col("old_balance_dest") < 0), F.lit("BAD_BALANCE"))
         .when(F.col("source").isNotNull() & ~F.col("source").isin(SOURCES), F.lit("BAD_SOURCE"))
         .when((F.lit(ENVIRONMENT) == "production") & (F.col("source") == "SIMULATED_DEMO"),
               F.lit("SIMULATED_EVENT_IN_PRODUCTION"))
