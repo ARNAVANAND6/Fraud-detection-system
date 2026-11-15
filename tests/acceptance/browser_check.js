@@ -25,7 +25,9 @@ async function send(id) {
 
 (async () => {
   const browser = await chromium.launch();
-  const page = await browser.newPage({ viewport: { width: 1500, height: 1000 }, deviceScaleFactor: 2 });
+  // TLS_INSECURE=1 accepts the proxy's locally issued certificate when testing https://localhost.
+  const page = await browser.newPage({ viewport: { width: 1500, height: 1000 }, deviceScaleFactor: 2,
+    ignoreHTTPSErrors: process.env.TLS_INSECURE === "1" });
   let navigations = 0;
   page.on("framenavigated", (f) => { if (f === page.mainFrame()) navigations += 1; });
   await page.goto(DASH);

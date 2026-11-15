@@ -219,20 +219,24 @@ class Repository:
         several workers can call it without escalating the same alert twice."""
         ap = policy.alerts
         with self.pool.connection() as c, c.transaction():
+            # One statement: the update and its audit rows travel together, so a
+            # backlog of hundreds of overdue alerts costs one round trip, not one each.
             rows = c.execute(
-                """UPDATE alerts SET escalation_level = escalation_level + 1, escalated_at = clock_timestamp(),
-                       priority = greatest(priority - 1, 1), assigned_to = %s,
-                       sla_due_at = clock_timestamp() + make_interval(secs => 60 * coalesce(
-                           (%s::jsonb ->> greatest(priority - 1, 1)::text)::float, 60)),
-                       updated_at = clock_timestamp()
-                   WHERE status = 'OPEN' AND sla_due_at < clock_timestamp() AND escalation_level < %s
-                   RETURNING *""",
-                (ap.supervisor, json.dumps(ap.sla_minutes), ap.max_escalations)).fetchall()
-            for r in rows:
-                c.execute(
-                    "INSERT INTO alert_events (alert_id, kind, detail, actor) "
-                    "VALUES (%s,'ESCALATED',%s,'alert-engine')",
-                    (r["alert_id"], Jsonb({"level": r["escalation_level"], "assigned_to": ap.supervisor})))
+                """WITH up AS (
+                       UPDATE alerts SET escalation_level = escalation_level + 1, escalated_at = clock_timestamp(),
+                           priority = greatest(priority - 1, 1), assigned_to = %s,
+                           sla_due_at = clock_timestamp() + make_interval(secs => 60 * coalesce(
+                               (%s::jsonb ->> greatest(priority - 1, 1)::text)::float, 60)),
+                           updated_at = clock_timestamp()
+                       WHERE status = 'OPEN' AND sla_due_at < clock_timestamp() AND escalation_level < %s
+                       RETURNING *),
+                   logged AS (
+                       INSERT INTO alert_events (alert_id, kind, detail, actor)
+                       SELECT alert_id, 'ESCALATED',
+                              jsonb_build_object('level', escalation_level, 'assigned_to', %s::text), 'alert-engine'
+                       FROM up)
+                   SELECT * FROM up""",
+                (ap.supervisor, json.dumps(ap.sla_minutes), ap.max_escalations, ap.supervisor)).fetchall()
         return rows
 
     def save_label(self, transaction_id: str, is_fraud: bool, source: str) -> None:

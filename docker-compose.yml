@@ -89,10 +89,29 @@ services:
       interval: 10s
 
   dashboard:
-    build: { context: services/dashboard }
+    build:
+      context: services/dashboard
+      # Empty = same origin, which is what the TLS proxy serves. Plain http://localhost:3000 still
+      # works for development because the API allows that origin.
+      args: { VITE_API_URL: "${DASHBOARD_API_URL-http://localhost:8000}" }
     profiles: [app]
     ports: ["3000:80"]
     depends_on: [api]
+
+  # HTTPS for the dashboard and API on one origin:  docker compose --profile app --profile tls up -d
+  # then open https://localhost (set DASHBOARD_API_URL= in .env so the dashboard calls its own origin).
+  proxy:
+    image: caddy:2.8-alpine
+    profiles: [tls]
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./infra/proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [api, dashboard]
+    restart: unless-stopped
 
   spark:
     build: { context: ., dockerfile: docker/spark.Dockerfile }
@@ -134,3 +153,5 @@ volumes:
   pg-data:
   lake:
   ivy-cache:
+  caddy-data:
+  caddy-config:
