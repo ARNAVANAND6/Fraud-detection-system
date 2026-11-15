@@ -1,10 +1,10 @@
 {
   "pipeline_mode": "direct",
-  "post_to_dashboard_push_s": 0.234,
+  "post_to_dashboard_push_s": 0.039,
   "kafka_path": [
-    "demo.payments.transactions.v1[1]@15856",
-    "demo.payments.transactions.v1[1]@15856",
-    "demo.payments.scored.v1[3]@15219"
+    "demo.payments.transactions.v1[0]@55658",
+    "demo.payments.transactions.v1[0]@55658",
+    "demo.payments.scored.v1[4]@55234"
   ],
   "prediction": {
     "risk_score": 0.999974,
@@ -19,18 +19,18 @@
       "HIGH_RISK_TXN_TYPE"
     ],
     "model_version": "v0.2-synthetic",
-    "inference_ms": 2.615
+    "inference_ms": 3.143
   },
-  "risky_txn": "TXN_ACC_a7dcc6e25fa0",
+  "risky_txn": "TXN_ACC_c088c7e5c673",
   "alert": {
-    "alert_id": 707,
+    "alert_id": 2855,
     "priority": 1,
     "trigger_types": [
       "RISK_SCORE",
       "AMOUNT",
       "BEHAVIOUR"
     ],
-    "assigned_to": "analyst-1"
+    "assigned_to": "analyst-3"
   },
   "duplicates": {
     "deliveries": 6,
@@ -39,44 +39,44 @@
   },
   "performance": {
     "window_minutes": 5,
-    "samples": 17996,
-    "throughput_tps": 112.16,
+    "samples": 12031,
+    "throughput_tps": 51.19,
     "pipeline_ms": {
-      "p50": 64234.615,
-      "p95": 184014.556,
-      "p99": 192432.793
+      "p50": 29.682,
+      "p95": 6655.134,
+      "p99": 15507.816
     },
     "inference_ms": {
-      "p50": 0.24,
-      "p95": 0.418,
-      "p99": 2.454
+      "p50": 0.366,
+      "p95": 0.558,
+      "p99": 1.134
     },
     "feature_ms": {
-      "p50": 0.854,
-      "p95": 2.302,
-      "p99": 4.627
+      "p50": 1.038,
+      "p95": 2.006,
+      "p99": 4.334
     },
     "ingest_ms": {
-      "p50": 2.148,
-      "p95": 28.475,
-      "p99": 28.475,
-      "samples": 12
+      "p50": 1.223,
+      "p95": 2.507,
+      "p99": 4.904,
+      "samples": 24
     },
     "push_ms": {
-      "p50": 7.731,
-      "p95": 12.22,
-      "p99": 29.77,
+      "p50": 4.467,
+      "p95": 10.499,
+      "p99": 16.921,
       "samples": 2000
     },
-    "consumer_lag": 18,
+    "consumer_lag": 1,
     "spark_backlog": null,
-    "events_received": 95046,
-    "events_dead_lettered": 374,
-    "error_rate": 0.003935,
-    "measured_at": "2026-11-13T18:41:04.130961+00:00"
+    "events_received": 333065,
+    "events_dead_lettered": 912,
+    "error_rate": 0.002738,
+    "measured_at": "2026-11-15T09:22:31.148674+00:00"
   },
-  "seconds_to_show_disconnected": 6.2,
-  "seconds_to_recover_backlog": 8.8,
-  "run_at": "2026-11-13T18:41:23.939155+00:00",
+  "seconds_to_show_disconnected": 6.4,
+  "seconds_to_recover_backlog": 7.3,
+  "run_at": "2026-11-15T09:22:49.455214+00:00",
   "environment": "demo"
 }
