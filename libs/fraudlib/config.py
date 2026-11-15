@@ -20,8 +20,8 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-def _env_list(name: str) -> tuple[str, ...]:
-    return tuple(item.strip() for item in _env(name, "").split(",") if item.strip())
+def _env_list(name: str, default: str = "") -> tuple[str, ...]:
+    return tuple(item.strip() for item in _env(name, default).split(",") if item.strip())
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,14 @@ class Settings:
         default_factory=lambda: tuple(k for k in _env("API_KEYS", DEMO_API_KEY).split(",") if k)
     )
     webhook_secret: str = field(default_factory=lambda: _env("WEBHOOK_SECRET", ""))
+    # Payment-gateway webhooks (connectors.py). Empty = that connector is off.
+    razorpay_webhook_secret: str = field(default_factory=lambda: _env("RAZORPAY_WEBHOOK_SECRET", ""))
+    stripe_webhook_secret: str = field(default_factory=lambda: _env("STRIPE_WEBHOOK_SECRET", ""))
+    # Only payments in these currencies are scored; amounts are not converted.
+    connector_currencies: tuple[str, ...] = field(
+        default_factory=lambda: tuple(c.upper() for c in _env_list("CONNECTOR_CURRENCIES", "INR")))
+    # Where operational alerts go (notify.py): a Slack, Teams or generic incoming-webhook URL. Empty = off.
+    alert_webhook_url: str = field(default_factory=lambda: _env("ALERT_WEBHOOK_URL", ""))
     # First administrator, created at start-up if no such user exists yet.
     admin_username: str = field(default_factory=lambda: _env("ADMIN_USERNAME", DEMO_ADMIN_USERNAME).lower())
     admin_password: str = field(default_factory=lambda: _env("ADMIN_PASSWORD", DEMO_ADMIN_PASSWORD))

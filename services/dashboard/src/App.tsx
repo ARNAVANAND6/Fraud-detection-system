@@ -1,18 +1,39 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import QRCode from "qrcode";
 import {
-  Alert, AlertDetail, AlertStatus, AuditRow, Drift, DriftStatus, LEVELS, Me, Pct, Policy, RiskLevel, Role, SOURCE_LABEL, Source, Stats, Txn,
-  TxnDetail, User, api, session,
+  Alert, AlertDetail, AlertStatus, AuditRow, Connector, Drift, DriftStatus, LEVELS, Me, Pct, Policy, RiskLevel, Role, SOURCE_LABEL,
+  ScoreResult, Source, Stats, Status, Txn, TxnDetail, User, api, session,
 } from "./api";
 import { LEVEL_COLOR, LEVEL_ICON, MinuteSeries, RiskDistribution } from "./charts";
 import { Live, useLive } from "./live";
 import { Scene3D } from "./Scene3D";
 
-type Tab = "overview" | "alerts" | "performance" | "ingest" | "settings" | "admin";
+type Tab = "overview" | "alerts" | "check" | "performance" | "integrations" | "ingest" | "settings" | "admin" | "security";
 // What each role sees. The server enforces the same rules; this only hides what would be refused.
 const TABS: Record<Role, Tab[]> = {
-  VIEWER: ["overview", "alerts", "performance"],
-  ANALYST: ["overview", "alerts", "performance"],
-  ADMIN: ["overview", "alerts", "performance", "ingest", "settings", "admin"],
+  VIEWER: ["overview", "alerts", "performance", "integrations", "security"],
+  ANALYST: ["overview", "alerts", "check", "performance", "integrations", "security"],
+  ADMIN: ["overview", "alerts", "check", "performance", "integrations", "ingest", "settings", "admin", "security"],
+};
+const NAV: { group: string; tabs: Tab[] }[] = [
+  { group: "Monitor", tabs: ["overview", "alerts", "check"] },
+  { group: "System", tabs: ["performance", "integrations"] },
+  { group: "Administration", tabs: ["ingest", "settings", "admin"] },
+];
+const TAB_LABEL: Record<Tab, string> = {
+  overview: "Overview", alerts: "Alerts", check: "Check a transaction", performance: "Performance", integrations: "Integrations",
+  ingest: "Data intake", settings: "Settings", admin: "People and audit", security: "Security",
+};
+const TAB_INTRO: Record<Tab, string> = {
+  overview: "Scored transactions, as stored by the pipeline.",
+  alerts: "Work the queue. Every change is recorded in the audit log under your name.",
+  check: "Score one transaction against the live model and feature store. Nothing is stored.",
+  performance: "Latency, throughput and model health, measured by the running system.",
+  integrations: "Where transactions come from, and whether each source is delivering.",
+  ingest: "Send test data through the same pipeline as production traffic.",
+  settings: "Risk thresholds and alert rules. Changes apply within about 5 seconds.",
+  admin: "Who can sign in, what they may do, and what they did.",
+  security: "Your own sign-in settings.",
 };
 type Health = "live" | "idle" | "delayed" | "disconnected" | "offline" | "connecting";
 
@@ -20,6 +41,7 @@ const inr = (n: number) => "₹" + Number(n).toLocaleString("en-IN", { maximumFr
 const num = (n: number) => n.toLocaleString("en-IN");
 const clock = (iso: string | null | undefined) => (iso ? new Date(iso).toLocaleTimeString() : "never");
 const ms = (v: number | null | undefined) => (v == null ? "n/a" : v >= 1000 ? `${(v / 1000).toFixed(2)} s` : `${v.toFixed(v < 10 ? 2 : 0)} ms`);
+const notFound = (e: unknown) => String((e as Error)?.message ?? e).startsWith("404");
 
 function ago(iso: string | null | undefined, now: number): string {
   if (!iso) return "never";
@@ -56,8 +78,6 @@ function health(live: Live): { state: Health; title: string; detail: string } {
   return { state: "live", title: "LIVE", detail: "" };
 }
 
-const HEALTH_ICON: Record<Health, string> = { live: "●", idle: "○", delayed: "▲", disconnected: "✕", offline: "✕", connecting: "…" };
-
 function SourceBadge({ source }: { source: Source }) {
   return <span className={`src src-${source}`}>{SOURCE_LABEL[source] ?? source}</span>;
 }
@@ -67,47 +87,116 @@ function LevelBadge({ level }: { level: RiskLevel }) {
 function Chips({ items }: { items: string[] }) {
   return <>{items.map((c) => <span className="chip" key={c}>{c}</span>)}</>;
 }
+/** Risk score as a number with a short bar behind it, so a column of scores can be scanned. */
+function ScoreBar({ score, level }: { score: number; level: RiskLevel }) {
+  return (
+    <span className="scorebar" title={`risk score ${score.toFixed(6)}`}>
+      <span className="scorebar-track"><span style={{ width: `${Math.max(2, score * 100)}%`, background: LEVEL_COLOR[level] }} /></span>
+      <span className="scorebar-num">{score.toFixed(3)}</span>
+    </span>
+  );
+}
+
+// ---- sign-in ---------------------------------------------------------------------------
+
+/** Reads #sso_token / #sso_error that the API appends when it redirects back after single sign-on. */
+function takeSsoResult(): { error: string | null } {
+  const h = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+  const tok = h.get("sso_token");
+  const err = h.get("sso_error");
+  if (tok || err) history.replaceState(null, "", window.location.pathname + window.location.search);
+  if (tok) session.set(tok);
+  return { error: err };
+}
 
 export default function App() {
+  const [ssoError] = useState(() => takeSsoResult().error);
   const [me, setMe] = useState<Me | null>(null);
   const [checking, setChecking] = useState(session.has());
   useEffect(() => {
     if (session.has()) api.me().then(setMe).catch(() => undefined).finally(() => setChecking(false));
     return session.onExpired(() => setMe(null));
   }, []);
-  if (checking) return <div className="empty">Checking your session.</div>;
-  if (!me) return <SignIn onSignedIn={setMe} />;
+  if (checking) return <div className="boot">Checking your session.</div>;
+  if (!me) return <SignIn onSignedIn={setMe} initialError={ssoError} />;
   return <Console me={me} onSignOut={() => { api.logout().catch(() => undefined).finally(() => setMe(null)); }} />;
 }
 
-function SignIn({ onSignedIn }: { onSignedIn: (me: Me) => void }) {
+function loginError(m: string): string {
+  if (m.startsWith("401")) return "Wrong username or password.";
+  if (m.startsWith("429")) return "Too many failed attempts. Try again in 15 minutes.";
+  if (m.includes("Failed to fetch")) return "Cannot reach the VYROX server.";
+  return m;
+}
+
+function SignIn({ onSignedIn, initialError }: { onSignedIn: (me: Me) => void; initialError: string | null }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
+  const [code, setCode] = useState("");
+  const [mfa, setMfa] = useState<{ token: string; until: number } | null>(null);
+  const [error, setError] = useState(initialError ? `Single sign-on failed: ${initialError}` : "");
   const [busy, setBusy] = useState(false);
+  const [sso, setSso] = useState<{ enabled: boolean; provider_name: string | null } | null>(null);
+  useEffect(() => { api.sso().then(setSso).catch(() => setSso(null)); }, []);
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true); setError("");
-    try { onSignedIn(await api.login(username, password)); }
+    try {
+      const r = await api.login(username, password);
+      if (r.kind === "done") onSignedIn(r.me);
+      else { setMfa({ token: r.mfaToken, until: Date.now() + r.expiresIn * 1000 }); setPassword(""); }
+    } catch (err) { setError(loginError((err as Error).message)); } finally { setBusy(false); }
+  };
+  const submitCode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!mfa) return;
+    if (Date.now() > mfa.until) { setMfa(null); setCode(""); setError("That step timed out. Sign in again."); return; }
+    setBusy(true); setError("");
+    try { onSignedIn(await api.loginMfa(mfa.token, code.trim())); }
     catch (err) {
       const m = (err as Error).message;
-      setError(m.startsWith("401") ? "Wrong username or password." : m.startsWith("429") ? "Too many failed attempts. Try again in 15 minutes."
-        : m.includes("Failed to fetch") ? "Cannot reach the VYROX server." : m);
+      setError(m.startsWith("401") ? "That code was not accepted. Codes change every 30 seconds." : loginError(m));
     } finally { setBusy(false); }
   };
+
   return (
     <div className="signin">
-      <form className="panel signin-card" onSubmit={submit} data-testid="signin">
-        <div className="brand">VYROX</div>
-        <p className="muted">Sign in to the fraud operations console.</p>
-        <label>Username<input autoFocus autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} /></label>
-        <label>Password<input type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
-        {error && <div className="error" role="alert">{error}</div>}
-        <button className="on" type="submit" disabled={busy || !username || !password}>{busy ? "Signing in" : "Sign in"}</button>
-      </form>
+      <div className="signin-card glass">
+        <div className="signin-brand"><span className="mark" aria-hidden>V</span> VYROX</div>
+        {!mfa ? (
+          <form onSubmit={submit} data-testid="signin">
+            <h1>Sign in</h1>
+            <p className="muted">Fraud operations console.</p>
+            <label>Username<input autoFocus autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} /></label>
+            <label>Password<input type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+            {error && <div className="error" role="alert">{error}</div>}
+            <button className="primary wide" type="submit" disabled={busy || !username || !password}>{busy ? "Signing in" : "Sign in"}</button>
+            {sso?.enabled && (
+              <>
+                <div className="or"><span>or</span></div>
+                <button type="button" className="wide" onClick={() => { window.location.href = api.ssoStartUrl(); }}>
+                  Sign in with {sso.provider_name ?? "your organisation"}
+                </button>
+              </>
+            )}
+          </form>
+        ) : (
+          <form onSubmit={submitCode} data-testid="signin-mfa">
+            <h1>Two-step verification</h1>
+            <p className="muted">Enter the 6-digit code from your authenticator app for <b>{username}</b>, or one of your recovery codes.</p>
+            <label>Code<input autoFocus inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(e) => setCode(e.target.value)} /></label>
+            {error && <div className="error" role="alert">{error}</div>}
+            <button className="primary wide" type="submit" disabled={busy || code.trim().length < 6}>{busy ? "Checking" : "Verify"}</button>
+            <button type="button" className="link" onClick={() => { setMfa(null); setCode(""); setError(""); }}>Use a different account</button>
+          </form>
+        )}
+      </div>
     </div>
   );
 }
+
+// ---- console shell --------------------------------------------------------------------
 
 function Console({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const [tab, setTab] = useState<Tab>("overview");
@@ -131,66 +220,96 @@ function Console({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const feed = useMemo(() => (source ? live.feed.filter((t) => t.source === source) : live.feed), [live.feed, source]);
   const env = st?.environment;
   const perf = live.stats?.performance;
+  const allowed = TABS[me.role];
 
   return (
-    <div className="app">
-      <header>
-        <div className="brand">VYROX</div>
+    <div className="shell">
+      <aside className="side glass">
+        <div className="side-brand">
+          <span className="mark" aria-hidden>V</span>
+          <span className="side-name">VYROX</span>
+        </div>
         <div className={`env env-${env ?? "unknown"}`} title="Environment of the server this dashboard is connected to">
-          {env === "demo" ? "DEMO ENVIRONMENT · simulated data" : env === "production" ? "PRODUCTION" : "ENVIRONMENT UNKNOWN"}
+          {env === "demo" ? "DEMO · simulated data" : env === "production" ? "PRODUCTION" : "ENVIRONMENT UNKNOWN"}
         </div>
-        <nav className="tabs">
-          {TABS[me.role].map((t) => (
-            <button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>
-              {t === "alerts" && live.stats ? `Alerts (${live.stats.alerts.open} open)` : t[0].toUpperCase() + t.slice(1)}
-            </button>
-          ))}
+        <nav className="tabs" aria-label="Sections">
+          {NAV.map((g) => {
+            const items = g.tabs.filter((t) => allowed.includes(t));
+            if (!items.length) return null;
+            return (
+              <div className="nav-group" key={g.group}>
+                <div className="nav-label">{g.group}</div>
+                {items.map((t) => (
+                  <button key={t} className={tab === t ? "on" : ""} aria-current={tab === t ? "page" : undefined} onClick={() => setTab(t)}>
+                    <span>{TAB_LABEL[t]}</span>
+                    {t === "alerts" && live.stats ? <span className="count">{num(live.stats.alerts.open)}</span> : null}
+                  </button>
+                ))}
+              </div>
+            );
+          })}
         </nav>
-        <label className="filter">Data source
-          <select value={source ?? ""} onChange={(e) => setSource((e.target.value || null) as Source | null)}>
-            <option value="">All sources</option>
-            {(Object.keys(SOURCE_LABEL) as Source[]).map((s) => <option key={s} value={s}>{SOURCE_LABEL[s]}</option>)}
-          </select>
-        </label>
-        <div className={`pill pill-${h.state}`} data-testid="stream-pill"><span>{HEALTH_ICON[h.state]}</span> {h.title}</div>
-        <div className="who" data-testid="who" title={`Signed in as ${me.username}`}>
-          <b>{me.username}</b> <span className="muted">{me.role.toLowerCase()}</span>
-          <button onClick={onSignOut}>Sign out</button>
+        <div className="side-foot">
+          <button className={`side-link ${tab === "security" ? "on" : ""}`} onClick={() => setTab("security")}>Security</button>
+          <div className="who" data-testid="who" title={`Signed in as ${me.username}`}>
+            <span className="avatar" aria-hidden>{me.username.slice(0, 1).toUpperCase()}</span>
+            <span className="who-text"><b>{me.username}</b><span className="muted">{me.role.toLowerCase()}</span></span>
+            <button className="ghost" onClick={onSignOut}>Sign out</button>
+          </div>
         </div>
-      </header>
+      </aside>
 
-      <section className="statusbar" data-testid="statusbar">
-        <Fact label="Stream status" value={st && live.conn === "connected" ? st.stream_status : "UNKNOWN"} testid="stream-status" />
-        <Fact label="Connection" testid="connection"
-              value={live.conn === "connected" ? "Connected" : live.conn === "connecting" ? "Connecting" : "Disconnected"}
-              sub={live.conn === "connected" ? `last message ${live.lastMessageAt ? ago(new Date(live.lastMessageAt).toISOString(), now) : "never"}` : `retrying, ${live.reconnects} attempts`} />
-        <Fact label="Data source" value={st?.active_sources.length ? st.active_sources.map((s) => SOURCE_LABEL[s]).join(", ") : "none active"}
-              sub="sources with events in the last minute" />
-        <Fact label="Last event received" value={clock(st?.last_event_at)} sub={ago(st?.last_event_at, now)} testid="last-event" />
-        <Fact label="Last successful inference" value={clock(st?.last_inference_at)} sub={st?.model_version ? `model ${st.model_version}` : "model unknown"} />
-        <Fact label="Processing latency" value={perf?.pipeline_ms ? ms(perf.pipeline_ms.p50) : "n/a"}
-              sub={perf?.pipeline_ms ? `P50, ingest to stored, last ${perf.window_minutes} min` : "no events in the last 5 min"} />
-      </section>
+      <div className="content">
+        <header className="topbar">
+          <div className="crumbs">
+            <span className="muted">Workspace</span><span className="sep">/</span><h2>{TAB_LABEL[tab]}</h2>
+            <p className="intro muted">{TAB_INTRO[tab]}</p>
+          </div>
+          <label className="filter">Data source
+            <select value={source ?? ""} onChange={(e) => setSource((e.target.value || null) as Source | null)}>
+              <option value="">All sources</option>
+              {(Object.keys(SOURCE_LABEL) as Source[]).map((s) => <option key={s} value={s}>{SOURCE_LABEL[s]}</option>)}
+            </select>
+          </label>
+          <div className={`pill pill-${h.state}`} data-testid="stream-pill"><span className="dot" aria-hidden /> {h.title}</div>
+        </header>
 
-      {h.state !== "live" && (
-        <div className={`banner banner-${h.state}`} role="status" data-testid="banner">
-          <b>{HEALTH_ICON[h.state]} {h.title}.</b> {h.detail}
-        </div>
-      )}
+        <section className="statusbar" data-testid="statusbar">
+          <Fact label="Stream status" value={st && live.conn === "connected" ? st.stream_status : "UNKNOWN"} testid="stream-status" />
+          <Fact label="Connection" testid="connection"
+                value={live.conn === "connected" ? "Connected" : live.conn === "connecting" ? "Connecting" : "Disconnected"}
+                sub={live.conn === "connected" ? `last message ${live.lastMessageAt ? ago(new Date(live.lastMessageAt).toISOString(), now) : "never"}` : `retrying, ${live.reconnects} attempts`} />
+          <Fact label="Data source" value={st?.active_sources.length ? st.active_sources.map((s) => SOURCE_LABEL[s]).join(", ") : "none active"}
+                sub="sources with events in the last minute" />
+          <Fact label="Last event" value={clock(st?.last_event_at)} sub={ago(st?.last_event_at, now)} testid="last-event" />
+          <Fact label="Last inference" value={clock(st?.last_inference_at)} sub={st?.model_version ? `model ${st.model_version}` : "model unknown"} />
+          <Fact label="Processing latency" value={perf?.pipeline_ms ? ms(perf.pipeline_ms.p50) : "n/a"}
+                sub={perf?.pipeline_ms ? `P50, ingest to stored, last ${perf.window_minutes} min` : "no events in the last 5 min"} />
+        </section>
 
-      <main className={h.state === "live" ? "" : "stale"}>
-        {tab === "overview" && <Overview stats={stats} feed={feed} live={live} source={source} now={now} onOpen={setOpenTxn} isLive={h.state === "live"} />}
-        {tab === "alerts" && <Alerts live={live} now={now} onOpenTxn={setOpenTxn} me={me} />}
-        {tab === "performance" && <PerformanceTab live={live} />}
-        {tab === "ingest" && <Ingest env={env} />}
-        {tab === "settings" && <Settings />}
-        {tab === "admin" && <Admin me={me} />}
-      </main>
-      {openTxn && <TxnDrawer id={openTxn} onClose={() => setOpenTxn(null)} />}
-      <footer>
-        Risk scores are model estimates on {env === "production" ? "ingested" : "simulated"} data, not banking or regulatory decisions.
-        Every figure on this page is read from stored records or measured by the running system.
-      </footer>
+        {h.state !== "live" && (
+          <div className={`banner banner-${h.state}`} role="status" data-testid="banner">
+            <b>{h.title}.</b> {h.detail}
+          </div>
+        )}
+
+        <main className={h.state === "live" ? "" : "stale"}>
+          {tab === "overview" && <Overview stats={stats} feed={feed} live={live} source={source} now={now} onOpen={setOpenTxn} isLive={h.state === "live"} />}
+          {tab === "alerts" && <Alerts live={live} now={now} onOpenTxn={setOpenTxn} me={me} />}
+          {tab === "check" && <CheckTransaction />}
+          {tab === "performance" && <PerformanceTab live={live} now={now} />}
+          {tab === "integrations" && <Integrations now={now} />}
+          {tab === "ingest" && <Ingest env={env} />}
+          {tab === "settings" && <Settings />}
+          {tab === "admin" && <Admin me={me} />}
+          {tab === "security" && <Security me={me} />}
+        </main>
+        {openTxn && <TxnDrawer id={openTxn} onClose={() => setOpenTxn(null)} />}
+        <footer>
+          Risk scores are model estimates on {env === "production" ? "ingested" : "simulated"} data, not banking or regulatory decisions.
+          Every figure on this page is read from stored records or measured by the running system.
+        </footer>
+      </div>
     </div>
   );
 }
@@ -215,6 +334,36 @@ function Kpi({ label, value, sub, testid }: { label: string; value: string; sub?
   );
 }
 
+// ---- overview -------------------------------------------------------------------------
+
+/** Half-circle gauge: share of stored transactions passed (LOW, MEDIUM) against flagged (HIGH, CRITICAL). */
+function ScreeningGauge({ levels }: { levels: Partial<Record<RiskLevel, number>> }) {
+  const passed = (levels.LOW ?? 0) + (levels.MEDIUM ?? 0);
+  const flagged = (levels.HIGH ?? 0) + (levels.CRITICAL ?? 0);
+  const total = passed + flagged;
+  if (!total) return <div className="empty">No scored transactions yet.</div>;
+  const share = flagged / total;
+  // Flagged is usually around 1%; a linear arc would be a sliver, so the arc uses a square-root scale and the
+  // exact share is printed underneath.
+  const arc = Math.min(1, Math.sqrt(share));
+  const r = 70, len = Math.PI * r;
+  return (
+    <div className="gauge">
+      <svg viewBox="0 0 180 104" role="img" aria-label={`${(100 * share).toFixed(2)}% of transactions flagged`}>
+        <path d="M 20 92 A 70 70 0 0 1 160 92" className="gauge-track" />
+        <path d="M 20 92 A 70 70 0 0 1 160 92" className="gauge-flag" strokeDasharray={`${arc * len} ${len}`} />
+        <text x="90" y="78" textAnchor="middle" className="gauge-num">{(100 * share).toFixed(share < 0.1 ? 2 : 1)}%</text>
+        <text x="90" y="95" textAnchor="middle" className="gauge-sub">flagged</text>
+      </svg>
+      <div className="gauge-legend">
+        <div><span className="sw sw-pass" /> Passed <b>{num(passed)}</b><span className="muted">LOW and MEDIUM</span></div>
+        <div><span className="sw sw-flag" /> Flagged <b>{num(flagged)}</b><span className="muted">HIGH and CRITICAL</span></div>
+      </div>
+      <p className="note">Arc length uses a square-root scale so a small share stays visible.</p>
+    </div>
+  );
+}
+
 function Overview({ stats, feed, live, source, now, onOpen, isLive }: {
   stats: Stats | null; feed: Txn[]; live: Live; source: Source | null; now: number; onOpen: (id: string) => void; isLive: boolean;
 }) {
@@ -231,88 +380,99 @@ function Overview({ stats, feed, live, source, now, onOpen, isLive }: {
     <>
       <div className="kpis">
         <Kpi label="Transactions processed" value={num(stats.processed)} testid="kpi-processed" sub={source ? SOURCE_LABEL[source] : "all sources, stored total"} />
-        <Kpi label="Transactions per second" value={stats.tps_last_minute.toFixed(1)} sub="stored in the last 60 s" />
+        <Kpi label="Per second" value={stats.tps_last_minute.toFixed(1)} sub="stored in the last 60 s" />
         <Kpi label="Total volume" value={inr(stats.total_volume)} sub="sum of stored amounts" />
-        <Kpi label="High-risk transactions" value={num(stats.high_risk)} sub={`${num(stats.critical)} critical`} />
-        <Kpi label="Alerts" value={num(live.stats?.alerts.open ?? 0)} testid="kpi-alerts"
-             sub={`open · ${live.stats?.alerts.escalated ?? 0} escalated · ${live.stats?.alerts.total ?? 0} total`} />
+        <Kpi label="High risk" value={num(stats.high_risk)} sub={`${num(stats.critical)} critical`} />
+        <Kpi label="Open alerts" value={num(live.stats?.alerts.open ?? 0)} testid="kpi-alerts"
+             sub={`${live.stats?.alerts.escalated ?? 0} escalated · ${num(live.stats?.alerts.total ?? 0)} total`} />
         <Kpi label="Average risk score" value={stats.avg_risk_score.toFixed(4)} sub="mean of stored scores" />
       </div>
 
       {mixed && (
         <div className="notice">
-          Totals above combine {stats.by_source.length} data sources. The table "By data source" below separates them, and the
-          "Data source" filter in the header restricts every figure to one source.
+          Totals combine {stats.by_source.length} data sources. "By data source" below separates them, and the
+          "Data source" filter at the top restricts every figure to one source.
         </div>
       )}
 
+      <div className="grid2">
+        <div className="panel">
+          <div className="panel-head"><h3>Transactions per minute</h3><span className="muted small">last 30 min, stored records</span></div>
+          <MinuteSeries kind="line" color="var(--series-1)" label="Transactions" points={stats.trend.map((t) => ({ minute: t.minute, value: t.txns }))} />
+          <div className="panel-head spaced"><h3>High risk per minute</h3></div>
+          <MinuteSeries kind="bars" color="var(--serious)" label="High-risk transactions" points={stats.trend.map((t) => ({ minute: t.minute, value: t.high_risk }))} />
+        </div>
+        <div className="panel">
+          <div className="panel-head"><h3>Screening outcome</h3><span className="muted small">{num(stats.processed)} stored</span></div>
+          <ScreeningGauge levels={stats.risk_levels} />
+          <div className="panel-head spaced"><h3>Risk distribution</h3></div>
+          <RiskDistribution levels={stats.risk_levels} />
+        </div>
+      </div>
+
       <div className="panel">
         <div className="panel-head">
-          <h3>Live transaction space <span className="muted">each point is one stored transaction: amount across, risk score up, age into the distance</span></h3>
+          <h3>Live transaction space</h3>
+          <span className="muted small grow">each point is one stored transaction: amount across, risk score up, age into the distance</span>
           <button onClick={toggle3d}>{show3d ? "Hide 3D view" : "Show 3D view"}</button>
         </div>
         {show3d && <Scene3D feed={feed} isLive={isLive} frozenAt={live.lastMessageAt} clockOffset={live.clockOffset} thresholds={thresholds} onOpen={onOpen} />}
       </div>
 
-      <div className="grid2">
-        <div className="panel">
-          <h3>Transactions per minute <span className="muted">last 30 min, stored records</span></h3>
-          <MinuteSeries kind="line" color="var(--series-1)" label="Transactions" points={stats.trend.map((t) => ({ minute: t.minute, value: t.txns }))} />
-          <h3 className="spaced">High-risk transactions per minute</h3>
-          <MinuteSeries kind="bars" color="var(--serious)" label="High-risk transactions" points={stats.trend.map((t) => ({ minute: t.minute, value: t.high_risk }))} />
-        </div>
-        <div className="panel">
-          <h3>Risk distribution <span className="muted">{num(stats.processed)} stored transactions</span></h3>
-          <RiskDistribution levels={stats.risk_levels} />
-          <h3 className="spaced">By data source</h3>
-          <table className="compact">
-            <thead><tr><th>Source</th><th className="r">Transactions</th><th className="r">Volume</th><th className="r">High risk</th><th>Last event</th></tr></thead>
-            <tbody>
-              {live.stats?.by_source.map((s) => (
-                <tr key={s.source}><td><SourceBadge source={s.source} /></td><td className="r">{num(s.txns)}</td>
-                  <td className="r">{inr(s.volume)}</td><td className="r">{num(s.high_risk)}</td><td>{ago(s.last_event_at, now)}</td></tr>
-              ))}
-              {!live.stats?.by_source.length && <tr><td colSpan={5} className="muted">No stored transactions.</td></tr>}
-            </tbody>
-          </table>
-          {q.labelled > 0 && (
-            <p className="note">
-              Simulator ground truth for {num(q.labelled)} labelled transactions: {q.tp} fraud flagged HIGH or CRITICAL, {q.fn} fraud
-              missed, {q.fp} legitimate flagged. Synthetic data only; this says nothing about real-world accuracy.
-            </p>
-          )}
-        </div>
-      </div>
-
       <div className="panel">
         <div className="panel-head">
-          <h3>{isLive ? "Live transaction feed" : "Transaction feed (not live)"} <span className="muted">
-            {isLive ? `${num(live.received)} events pushed to this browser since it connected` : "most recent stored transactions"}</span></h3>
-          <div className="tabs small">
+          <h3>{isLive ? "Live transaction feed" : "Transaction feed (not live)"}</h3>
+          <span className="muted small grow">
+            {isLive ? `${num(live.received)} events pushed to this browser since it connected` : "most recent stored transactions"}</span>
+          <div className="seg">
             <button className={!suspicious ? "on" : ""} onClick={() => setSuspicious(false)}>All</button>
             <button className={suspicious ? "on" : ""} onClick={() => setSuspicious(true)}>Suspicious only</button>
           </div>
         </div>
-        <table data-testid="feed">
-          <thead><tr><th>Stored at</th><th>Source</th><th>Transaction</th><th>Account</th><th>Type</th><th className="r">Amount</th>
-            <th className="r">Risk</th><th>Level</th><th>Decision</th><th>Reasons</th><th className="r">Latency</th></tr></thead>
+        <div className="table-wrap">
+          <table data-testid="feed">
+            <thead><tr><th>Stored at</th><th>Source</th><th>Transaction</th><th>Account</th><th>Type</th><th className="r">Amount</th>
+              <th>Risk score</th><th>Level</th><th>Decision</th><th>Reasons</th><th className="r">Latency</th></tr></thead>
+            <tbody>
+              {rows.map((t) => (
+                <tr key={t.transaction_id} className="clickable" onClick={() => onOpen(t.transaction_id)}>
+                  <td>{clock(t.persisted_at)}</td><td><SourceBadge source={t.source} /></td>
+                  <td className="mono">{t.transaction_id}</td><td className="mono">{t.account_id}</td><td>{t.txn_type}</td>
+                  <td className="r">{inr(t.amount)}</td><td><ScoreBar score={t.risk_score} level={t.risk_level} /></td>
+                  <td><LevelBadge level={t.risk_level} /></td><td><span className={`decision d-${t.decision}`}>{t.decision}</span></td>
+                  <td><Chips items={t.reason_codes} /></td><td className="r">{ms(t.pipeline_ms)}</td>
+                </tr>
+              ))}
+              {!rows.length && <tr><td colSpan={11} className="muted">No transactions to show.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-head"><h3>By data source</h3></div>
+        <table className="compact">
+          <thead><tr><th>Source</th><th className="r">Transactions</th><th className="r">Volume</th><th className="r">High risk</th><th>Last event</th></tr></thead>
           <tbody>
-            {rows.map((t) => (
-              <tr key={t.transaction_id} className="clickable" onClick={() => onOpen(t.transaction_id)}>
-                <td>{clock(t.persisted_at)}</td><td><SourceBadge source={t.source} /></td>
-                <td className="mono">{t.transaction_id}</td><td className="mono">{t.account_id}</td><td>{t.txn_type}</td>
-                <td className="r">{inr(t.amount)}</td><td className="r">{t.risk_score.toFixed(3)}</td>
-                <td><LevelBadge level={t.risk_level} /></td><td>{t.decision}</td><td><Chips items={t.reason_codes} /></td>
-                <td className="r">{ms(t.pipeline_ms)}</td>
-              </tr>
+            {live.stats?.by_source.map((s) => (
+              <tr key={s.source}><td><SourceBadge source={s.source} /></td><td className="r">{num(s.txns)}</td>
+                <td className="r">{inr(s.volume)}</td><td className="r">{num(s.high_risk)}</td><td>{ago(s.last_event_at, now)}</td></tr>
             ))}
-            {!rows.length && <tr><td colSpan={11} className="muted">No transactions to show.</td></tr>}
+            {!live.stats?.by_source.length && <tr><td colSpan={5} className="muted">No stored transactions.</td></tr>}
           </tbody>
         </table>
+        {q.labelled > 0 && (
+          <p className="note">
+            Simulator ground truth for {num(q.labelled)} labelled transactions: {num(q.tp)} fraud flagged HIGH or CRITICAL, {num(q.fn)} fraud
+            missed, {num(q.fp)} legitimate flagged. Synthetic data only; this says nothing about real-world accuracy.
+          </p>
+        )}
       </div>
     </>
   );
 }
+
+// ---- alerts ---------------------------------------------------------------------------
 
 const NEXT: Record<AlertStatus, AlertStatus[]> = {
   OPEN: ["IN_REVIEW", "CONFIRMED_FRAUD", "FALSE_POSITIVE"], IN_REVIEW: ["CONFIRMED_FRAUD", "FALSE_POSITIVE", "OPEN"],
@@ -341,46 +501,59 @@ function Alerts({ live, now, onOpenTxn, me }: { live: Live; now: number; onOpenT
   const sla = (a: Alert) => {
     if (a.status !== "OPEN") return "n/a";
     const left = (Date.parse(a.sla_due_at) - now) / 1000;
-    return left < 0 ? `overdue ${Math.round(-left / 60)} min` : `${Math.ceil(left / 60)} min left`;
+    return left < 0 ? <span className="overdue">overdue {Math.round(-left / 60)} min</span> : `${Math.ceil(left / 60)} min left`;
   };
   return (
     <div className="grid2 wide-left">
       <div className="panel">
         <div className="panel-head">
-          <h3>Alert queue <span className="muted">sorted by priority; one alert per account while it stays open</span></h3>
-          <div className="tabs small">
+          <h3>Alert queue</h3>
+          <span className="muted small grow">sorted by priority; one alert per account while it stays open</span>
+          <div className="seg">
             <button className={filter === "ACTIVE" ? "on" : ""} onClick={() => setFilter("ACTIVE")}>Open and in review</button>
             <button className={filter === "ALL" ? "on" : ""} onClick={() => setFilter("ALL")}>All</button>
           </div>
         </div>
         {error && <div className="error">{error}</div>}
-        <table data-testid="alerts">
-          <thead><tr><th>Priority</th><th>Alert</th><th>Status</th><th>Account</th><th>Triggers</th><th className="r">Max risk</th>
-            <th className="r">Events</th><th>Assigned to</th><th>Response time</th></tr></thead>
-          <tbody>
-            {rows.map((a) => (
-              <tr key={a.alert_id} className={`clickable ${selected === a.alert_id ? "sel" : ""}`} onClick={() => setSelected(a.alert_id)}>
-                <td><span className={`prio prio-${a.priority}`}>P{a.priority}</span></td><td>#{a.alert_id}</td>
-                <td>{a.status.replace("_", " ")}{a.escalation_level > 0 && <span className="esc"> ▲ escalated ×{a.escalation_level}</span>}</td>
-                <td className="mono">{a.account_id}</td><td><Chips items={a.trigger_types} /></td>
-                <td className="r">{a.max_risk_score.toFixed(3)}</td><td className="r">{a.event_count}</td>
-                <td>{a.assigned_to ?? "unassigned"}</td><td>{sla(a)}</td>
-              </tr>
-            ))}
-            {!rows.length && <tr><td colSpan={9} className="muted">No alerts.</td></tr>}
-          </tbody>
-        </table>
+        <div className="table-wrap">
+          <table data-testid="alerts">
+            <thead><tr><th>Priority</th><th>Alert</th><th>Status</th><th>Account</th><th>Triggers</th><th className="r">Max risk</th>
+              <th className="r">Events</th><th>Assigned to</th><th>Response time</th></tr></thead>
+            <tbody>
+              {rows.map((a) => (
+                <tr key={a.alert_id} className={`clickable ${selected === a.alert_id ? "sel" : ""}`} onClick={() => setSelected(a.alert_id)}>
+                  <td><span className={`prio prio-${a.priority}`}>P{a.priority}</span></td><td>#{a.alert_id}</td>
+                  <td><span className={`status s-${a.status}`}>{a.status.replace("_", " ").toLowerCase()}</span>
+                    {a.escalation_level > 0 && <span className="esc"> escalated ×{a.escalation_level}</span>}</td>
+                  <td className="mono">{a.account_id}</td><td><Chips items={a.trigger_types} /></td>
+                  <td className="r">{a.max_risk_score.toFixed(3)}</td><td className="r">{a.event_count}</td>
+                  <td>{a.assigned_to ?? <span className="muted">unassigned</span>}</td><td>{sla(a)}</td>
+                </tr>
+              ))}
+              {!rows.length && <tr><td colSpan={9} className="muted">No alerts.</td></tr>}
+            </tbody>
+          </table>
+        </div>
       </div>
-      <div className="panel">
+      <div className="panel sticky">
         {!detail ? <div className="empty">Select an alert to investigate it.</div> : (
           <>
-            <h3>Alert #{detail.alert_id} <span className={`prio prio-${detail.priority}`}>P{detail.priority}</span></h3>
+            <div className="panel-head"><h3>Alert #{detail.alert_id}</h3><span className={`prio prio-${detail.priority}`}>P{detail.priority}</span></div>
             <p className="big mono">{detail.account_id}</p>
-            <p>{detail.status.replace("_", " ")} · assigned to {detail.assigned_to ?? "nobody"} · {detail.event_count} transactions · {inr(detail.total_amount)}</p>
+            <dl className="facts">
+              <dt>Status</dt><dd><span className={`status s-${detail.status}`}>{detail.status.replace("_", " ").toLowerCase()}</span></dd>
+              <dt>Assigned to</dt><dd>{detail.assigned_to ?? "nobody"}</dd>
+              <dt>Transactions</dt><dd>{detail.event_count}</dd>
+              <dt>Amount</dt><dd>{inr(detail.total_amount)}</dd>
+            </dl>
             <p><Chips items={detail.reason_codes} /></p>
             {canWork ? (
               <div className="actions">
-                {NEXT[detail.status].map((s) => <button key={s} onClick={() => act(detail.alert_id, { status: s })}>{s === "OPEN" ? "Reopen" : s.replace("_", " ").toLowerCase()}</button>)}
+                {NEXT[detail.status].map((s) => (
+                  <button key={s} className={s === "CONFIRMED_FRAUD" ? "danger" : ""} onClick={() => act(detail.alert_id, { status: s })}>
+                    {s === "OPEN" ? "Reopen" : s === "IN_REVIEW" ? "Start review" : s === "CONFIRMED_FRAUD" ? "Confirm fraud" : "Mark false positive"}
+                  </button>
+                ))}
                 <button onClick={() => act(detail.alert_id, { assigned_to: me.username })}>Assign to me</button>
               </div>
             ) : <p className="muted">Your role can view alerts but not change them.</p>}
@@ -389,14 +562,16 @@ function Alerts({ live, now, onOpenTxn, me }: { live: Live; now: number; onOpenT
               <tbody>{detail.transactions.map((t) => (
                 <tr key={t.transaction_id} className="clickable" onClick={() => onOpenTxn(t.transaction_id)}>
                   <td>{clock(t.event_time)}</td><td>{t.txn_type}</td><td className="r">{inr(t.amount)}</td>
-                  <td className="r">{t.risk_score.toFixed(3)}</td><td><LevelBadge level={t.risk_level} /></td><td><SourceBadge source={t.source} /></td>
+                  <td><ScoreBar score={t.risk_score} level={t.risk_level} /></td><td><SourceBadge source={t.source} /></td>
                 </tr>))}</tbody>
             </table>
             <h4>History</h4>
-            <table className="compact">
-              <tbody>{detail.events.map((e, i) => (
-                <tr key={i}><td>{clock(e.at)}</td><td>{e.kind}</td><td>{e.actor}</td><td className="mono small">{JSON.stringify(e.detail)}</td></tr>))}</tbody>
-            </table>
+            <ol className="timeline">
+              {detail.events.map((e, i) => (
+                <li key={i}><span className="t-when">{clock(e.at)}</span><span className="t-what">{e.kind.replace(/_/g, " ").toLowerCase()}</span>
+                  <span className="t-who">{e.actor}</span>
+                  {Object.keys(e.detail).length > 0 && <span className="t-detail mono small">{JSON.stringify(e.detail)}</span>}</li>))}
+            </ol>
           </>
         )}
       </div>
@@ -404,7 +579,110 @@ function Alerts({ live, now, onOpenTxn, me }: { live: Live; now: number; onOpenT
   );
 }
 
-function PerformanceTab({ live }: { live: Live }) {
+// ---- check a transaction --------------------------------------------------------------
+
+const TXN_TYPES = ["PAYMENT", "TRANSFER", "CASH_OUT", "CASH_IN", "DEBIT"] as const;
+const DECISION_TEXT: Record<ScoreResult["decision"], string> = {
+  ALLOW: "No action needed", REVIEW: "Send for review", HOLD: "Hold for investigation",
+};
+
+/** Ring showing the risk score (0 to 1). It is a model score, not a calibrated probability. */
+function ScoreRing({ score, level }: { score: number; level: RiskLevel }) {
+  const r = 46, c = 2 * Math.PI * r;
+  return (
+    <svg className="ring" viewBox="0 0 120 120" role="img" aria-label={`risk score ${score.toFixed(3)}`}>
+      <circle cx="60" cy="60" r={r} className="ring-track" />
+      <circle cx="60" cy="60" r={r} className="ring-val" stroke={LEVEL_COLOR[level]}
+              strokeDasharray={`${Math.max(0.005, score) * c} ${c}`} transform="rotate(-90 60 60)" />
+      <text x="60" y="58" textAnchor="middle" className="ring-num">{score.toFixed(3)}</text>
+      <text x="60" y="76" textAnchor="middle" className="ring-sub">risk score</text>
+    </svg>
+  );
+}
+
+function CheckTransaction() {
+  const blank = { account_id: "", counterparty_id: "", txn_type: "TRANSFER", amount: "", old_balance_orig: "", old_balance_dest: "",
+                  channel: "APP", device_id: "" };
+  const [f, setF] = useState(blank);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<{ sent: typeof blank; r: ScoreResult } | null>(null);
+  const [error, setError] = useState("");
+  const set = (k: keyof typeof blank) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => setF({ ...f, [k]: e.target.value });
+  const ready = f.account_id && f.counterparty_id && Number(f.amount) > 0;
+  // A blank balance means "not known" and is left out, as payment-gateway events are; it is not read as zero.
+  const balance = (v: string) => (v.trim() === "" ? {} : { value: Number(v) });
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true); setError("");
+    try {
+      const r = await api.score({
+        transaction_id: `CHECK_${Date.now().toString(36)}`, event_time: new Date().toISOString(),
+        account_id: f.account_id.trim(), counterparty_id: f.counterparty_id.trim(), txn_type: f.txn_type,
+        amount: Number(f.amount),
+        ...("value" in balance(f.old_balance_orig) ? { old_balance_orig: Number(f.old_balance_orig) } : {}),
+        ...("value" in balance(f.old_balance_dest) ? { old_balance_dest: Number(f.old_balance_dest) } : {}),
+        channel: f.channel || "APP", ...(f.device_id.trim() ? { device_id: f.device_id.trim() } : {}),
+      });
+      setResult({ sent: f, r });
+    } catch (err) {
+      const m = (err as Error).message;
+      setError(m.startsWith("403") ? "Only analysts, administrators and API clients can run checks." : m.startsWith("422") ? `The server rejected a field: ${m.slice(5)}` : m);
+    } finally { setBusy(false); }
+  };
+  const r = result?.r;
+  return (
+    <div className="grid2 check">
+      <form className="panel" onSubmit={submit}>
+        <div className="panel-head"><h3>Transaction details</h3></div>
+        <div className="fields">
+          <label>Account<input value={f.account_id} onChange={set("account_id")} placeholder="C00000001" /></label>
+          <label>Counterparty<input value={f.counterparty_id} onChange={set("counterparty_id")} placeholder="M000000001" /></label>
+          <label>Type<select value={f.txn_type} onChange={set("txn_type")}>{TXN_TYPES.map((t) => <option key={t}>{t}</option>)}</select></label>
+          <label>Amount (₹)<input inputMode="decimal" value={f.amount} onChange={set("amount")} /></label>
+          <label><span>Sender balance before (₹) <span className="muted">(blank if unknown)</span></span><input inputMode="decimal" value={f.old_balance_orig} onChange={set("old_balance_orig")} /></label>
+          <label><span>Receiver balance before (₹) <span className="muted">(blank if unknown)</span></span><input inputMode="decimal" value={f.old_balance_dest} onChange={set("old_balance_dest")} /></label>
+          <label>Channel<input value={f.channel} onChange={set("channel")} /></label>
+          <label><span>Device id <span className="muted">(optional)</span></span><input value={f.device_id} onChange={set("device_id")} /></label>
+        </div>
+        {error && <div className="error" role="alert">{error}</div>}
+        <div className="actions">
+          <button className="primary" type="submit" disabled={busy || !ready}>{busy ? "Scoring" : "Score transaction"}</button>
+          <button type="button" onClick={() => { setF(blank); setResult(null); setError(""); }}>Clear</button>
+        </div>
+        <p className="note">
+          The account's history in the feature store is used, so the same payment can score differently for different accounts.
+          This is a dry run: nothing is stored, no alert is raised and the account's history is not changed.
+        </p>
+      </form>
+
+      <div className="panel">
+        <div className="panel-head"><h3>Result</h3>{r && <span className="muted small">{clock(r.scored_at)}</span>}</div>
+        {!r ? <div className="empty">Fill in the details and score the transaction.</div> : (
+          <div className="result">
+            <div className={`verdict v-${r.decision}`}>
+              <b>{DECISION_TEXT[r.decision]}</b>
+              <span>{r.decision} · <LevelBadge level={r.risk_level} /></span>
+            </div>
+            <ScoreRing score={r.risk_score} level={r.risk_level} />
+            <dl className="facts">
+              <dt>Payment</dt><dd>{inr(Number(result!.sent.amount))} {result!.sent.txn_type}</dd>
+              <dt>From → to</dt><dd className="mono">{result!.sent.account_id} → {result!.sent.counterparty_id}</dd>
+              <dt>Model</dt><dd>{r.model_version}</dd>
+              <dt>Inference</dt><dd>{ms(r.latency_ms)}</dd>
+            </dl>
+            <h4>Reasons</h4>
+            <p>{r.reason_codes.length ? <Chips items={r.reason_codes} /> : <span className="muted">No rule fired and the score is below MEDIUM.</span>}</p>
+            {r.disclaimer && <p className="note">{r.disclaimer}</p>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---- performance ----------------------------------------------------------------------
+
+function PerformanceTab({ live, now }: { live: Live; now: number }) {
   const p = live.stats?.performance;
   if (!p) return <div className="empty">No measurements received yet.</div>;
   const row = (name: string, where: string, v: Pct | null | undefined, samples?: number) => (
@@ -423,7 +701,7 @@ function PerformanceTab({ live }: { live: Live }) {
         <Kpi label="Duplicates skipped" value={live.status?.duplicates_skipped != null ? num(live.status.duplicates_skipped) : "n/a"} sub="by the scorer since it started" />
       </div>
       <div className="panel">
-        <h3>Latency <span className="muted">measured by the running system, last {p.window_minutes} minutes</span></h3>
+        <div className="panel-head"><h3>Latency</h3><span className="muted small">measured by the running system, last {p.window_minutes} minutes</span></div>
         <table>
           <thead><tr><th>Stage</th><th>What is measured</th><th className="r">P50</th><th className="r">P95</th><th className="r">P99</th><th className="r">Samples</th></tr></thead>
           <tbody>
@@ -441,8 +719,35 @@ function PerformanceTab({ live }: { live: Live }) {
           {live.status?.pipeline_mode === "spark" && " In this mode every event waits for a Spark micro-batch before scoring, which dominates end-to-end latency."}
         </p>
       </div>
+      <Nodes status={live.status} now={now} />
       <ModelHealth />
     </>
+  );
+}
+
+function Nodes({ status, now }: { status: Status | null; now: number }) {
+  const nodes = status?.nodes;
+  return (
+    <div className="panel" data-testid="nodes">
+      <div className="panel-head"><h3>Servers</h3><span className="muted small">
+        API and scorer processes seen in the last hour{status?.node ? `; this page is served by ${status.node}` : ""}</span></div>
+      {!nodes ? (
+        <div className="empty">This server does not report its processes. It is running as a single node.</div>
+      ) : (
+        <table className="compact">
+          <thead><tr><th>Process</th><th>Kind</th><th>State</th><th className="r">Partitions</th><th>Last heartbeat</th></tr></thead>
+          <tbody>
+            {nodes.map((n) => (
+              <tr key={`${n.kind}:${n.id}`}><td className="mono">{n.id}</td><td>{n.kind}</td>
+                <td><span className={`state ${n.alive ? "ok" : "bad"}`}>{n.alive ? "running" : "not responding"}</span></td>
+                <td className="r">{n.kind === "scorer" && n.alive ? n.partitions ?? "" : ""}</td>
+                <td>{ago(n.last_seen, now)}</td></tr>
+            ))}
+            {!nodes.length && <tr><td colSpan={5} className="muted">No processes reported.</td></tr>}
+          </tbody>
+        </table>
+      )}
+    </div>
   );
 }
 
@@ -464,7 +769,7 @@ function ModelHealth() {
   }, []);
   return (
     <div className="panel" data-testid="model-health">
-      <h3>Model health <span className="muted">live inputs compared with the data the model was trained on</span></h3>
+      <div className="panel-head"><h3>Model health</h3><span className="muted small">live inputs compared with the data the model was trained on</span></div>
       {err && <p className="note">Could not load the comparison: {err}</p>}
       {!d && !err && <div className="empty">Loading.</div>}
       {d?.status === "NO_REFERENCE" && <div className="empty">Model {d.model_version} has no training reference, so drift cannot be measured. Run ml/build_reference.py for it.</div>}
@@ -479,7 +784,7 @@ function ModelHealth() {
             <thead><tr><th>Model input</th><th className="r">PSI</th><th>Reading</th></tr></thead>
             <tbody>
               {d.features.map((f) => (
-                <tr key={f.feature}><td>{f.feature}</td><td className="r">{f.psi.toFixed(3)}</td>
+                <tr key={f.feature}><td className="mono">{f.feature}</td><td className="r">{f.psi.toFixed(3)}</td>
                   <td><span className={`drift ${f.status}`}>{DRIFT_TEXT[f.status]}</span></td></tr>
               ))}
             </tbody>
@@ -494,6 +799,87 @@ function ModelHealth() {
     </div>
   );
 }
+
+// ---- integrations ---------------------------------------------------------------------
+
+const CONNECTOR_NAME: Record<string, string> = { razorpay: "Razorpay", stripe: "Stripe", generic: "Signed webhook" };
+
+function Integrations({ now }: { now: number }) {
+  const [rows, setRows] = useState<Connector[] | null>(null);
+  const [alerting, setAlerting] = useState<boolean | null>(null);
+  const [state, setState] = useState<"loading" | "ok" | "missing" | "error">("loading");
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    let stop = false;
+    const load = () => api.connectors()
+      .then((r) => { if (!stop) { setRows(r.connectors); setAlerting(r.alert_webhook_configured); setState("ok"); } })
+      .catch((e) => { if (!stop) { setState(notFound(e) ? "missing" : "error"); setErr((e as Error).message); } });
+    load();
+    const t = setInterval(load, 15_000);
+    return () => { stop = true; clearInterval(t); };
+  }, []);
+  return (
+    <>
+      <div className="panel">
+        <div className="panel-head"><h3>Connected sources</h3><span className="muted small">refreshed every 15 s</span></div>
+        {state === "loading" && <div className="empty">Loading.</div>}
+        {state === "missing" && <div className="empty">This server does not report connectors. Update the API to a version with connector support.</div>}
+        {state === "error" && <div className="error">{err}</div>}
+        {state === "ok" && rows && (
+          <table data-testid="connectors">
+            <thead><tr><th>Name</th><th>Webhook path</th><th>State</th><th>Last event</th><th className="r">Events, 24 h</th><th>Last error</th></tr></thead>
+            <tbody>
+              {rows.map((c) => {
+                // Failing only while the newest thing that happened is an error.
+                const failing = !!c.last_error_at && (!c.last_event_at || c.last_error_at > c.last_event_at);
+                return (
+                  <tr key={c.name}>
+                    <td>{CONNECTOR_NAME[c.name] ?? c.name}{!c.balance_known && <div className="muted small">no balances: scored mainly by rules</div>}</td>
+                    <td className="mono small">{c.path}</td>
+                    <td><span className={`state ${!c.enabled ? "off" : failing ? "bad" : "ok"}`}>
+                      {!c.enabled ? "off" : failing ? "failing" : "on"}</span></td>
+                    <td>{ago(c.last_event_at, now)}</td><td className="r">{num(c.events_24h)}</td>
+                    <td className="small">{c.last_error ? <>{c.last_error} <span className="muted">({ago(c.last_error_at, now)})</span></>
+                      : <span className="muted">none</span>}</td>
+                  </tr>
+                );
+              })}
+              {!rows.length && <tr><td colSpan={6} className="muted">No connectors configured.</td></tr>}
+            </tbody>
+          </table>
+        )}
+      </div>
+      {alerting !== null && (
+        <div className="panel">
+          <div className="panel-head"><h3>Operational alerts</h3></div>
+          <p className="note">
+            {alerting
+              ? "Posting to the configured chat webhook: new priority-1 alerts (at most 10 an hour), stopped servers, a disconnected stream and failed backups."
+              : "Off. Set ALERT_WEBHOOK_URL to a Slack, Teams or other incoming webhook to be told about stopped servers, failed backups and priority-1 alerts."}
+          </p>
+        </div>
+      )}
+      <div className="panel">
+        <div className="panel-head"><h3>Ways data can arrive</h3></div>
+        <table className="compact">
+          <tbody>
+            <tr><td><SourceBadge source="LIVE_API" /></td><td>POST /v1/transactions with an API key</td></tr>
+            <tr><td><SourceBadge source="LIVE_WEBHOOK" /></td><td>POST /v1/webhooks/generic, HMAC-SHA256 signed, replay-protected; or a Razorpay or Stripe webhook, checked with the provider's signature</td></tr>
+            <tr><td><SourceBadge source="KAFKA_STREAM" /></td><td>events another system produces directly to the transactions topic</td></tr>
+            <tr><td><SourceBadge source="HISTORICAL_IMPORT" /></td><td>CSV or Parquet upload</td></tr>
+            <tr><td><SourceBadge source="SIMULATED_DEMO" /></td><td>built-in generator and fraud scenarios, demo environment only</td></tr>
+          </tbody>
+        </table>
+        <p className="note">
+          Real payment data only arrives through a provider integration the operator has authorised. Nothing here connects to UPI,
+          a bank or a card network on its own.
+        </p>
+      </div>
+    </>
+  );
+}
+
+// ---- data intake ----------------------------------------------------------------------
 
 function Ingest({ env }: { env: string | undefined }) {
   const [log, setLog] = useState<string[]>([]);
@@ -511,7 +897,7 @@ function Ingest({ env }: { env: string | undefined }) {
   return (
     <div className="grid2">
       <div className="panel">
-        <h3>Send data into the pipeline</h3>
+        <div className="panel-head"><h3>Send data into the pipeline</h3></div>
         {env === "demo" ? (
           <>
             <h4>Controlled fraud scenarios <SourceBadge source="SIMULATED_DEMO" /></h4>
@@ -526,7 +912,7 @@ function Ingest({ env }: { env: string | undefined }) {
         ) : <p className="muted">Fraud scenarios and the synthetic generator do not exist in the production environment.</p>}
         <h4>Authenticated REST API <SourceBadge source="LIVE_API" /></h4>
         <div className="actions">
-          <label>Amount <input value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" /></label>
+          <label className="inline">Amount <input value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" /></label>
           <button onClick={sendOne}>Send one transaction</button>
         </div>
         <h4>Historical file <SourceBadge source="HISTORICAL_IMPORT" /></h4>
@@ -536,28 +922,16 @@ function Ingest({ env }: { env: string | undefined }) {
           if (f) run(`Import ${f.name}`, async () => { const r = await api.upload(f); return `${r.rows} rows: ${r.accepted} accepted, ${r.duplicates} duplicates, ${r.invalid} invalid`; });
           e.target.value = "";
         }} />
-        <h4>Result</h4>
-        <pre className="log">{log.length ? log.join("\n") : "Nothing sent yet."}</pre>
       </div>
       <div className="panel">
-        <h3>Where data can come from</h3>
-        <table className="compact">
-          <tbody>
-            <tr><td><SourceBadge source="LIVE_API" /></td><td>POST /v1/transactions with an API key</td></tr>
-            <tr><td><SourceBadge source="LIVE_WEBHOOK" /></td><td>POST /v1/webhooks/generic, HMAC-SHA256 signed, replay-protected</td></tr>
-            <tr><td><SourceBadge source="KAFKA_STREAM" /></td><td>events another system produces directly to the transactions topic</td></tr>
-            <tr><td><SourceBadge source="HISTORICAL_IMPORT" /></td><td>CSV or Parquet upload</td></tr>
-            <tr><td><SourceBadge source="SIMULATED_DEMO" /></td><td>built-in generator and fraud scenarios, demo environment only</td></tr>
-          </tbody>
-        </table>
-        <p className="note">
-          VYROX has no connection to live UPI, bank or card-network transactions. Real payment data can only arrive through an
-          authorised provider integration that the operator sets up. No such integration is bundled.
-        </p>
+        <div className="panel-head"><h3>Result</h3></div>
+        <pre className="log">{log.length ? log.join("\n") : "Nothing sent yet."}</pre>
       </div>
     </div>
   );
 }
+
+// ---- settings -------------------------------------------------------------------------
 
 function Settings() {
   const [policy, setPolicy] = useState<Policy | null>(null);
@@ -573,7 +947,7 @@ function Settings() {
   };
   return (
     <div className="panel narrow">
-      <h3>Risk thresholds <span className="muted">applied to the model's risk probability</span></h3>
+      <div className="panel-head"><h3>Risk thresholds</h3><span className="muted small">applied to the model's risk score</span></div>
       <div className="form">
         {(["medium", "high", "critical"] as const).map((k) => (
           <label key={k}><LevelBadge level={k.toUpperCase() as RiskLevel} /> at or above
@@ -581,7 +955,7 @@ function Settings() {
         ))}
       </div>
       <p className="muted">Below MEDIUM is LOW. HIGH is sent for review, CRITICAL is held. Existing predictions keep the level they were scored with.</p>
-      <h3 className="spaced">Alert engine</h3>
+      <div className="panel-head spaced"><h3>Alert engine</h3></div>
       <div className="form">
         <label>Group repeat alerts for one account within (minutes)
           <input type="number" min="1" value={policy.alerts.dedup_minutes} onChange={(e) => setA("dedup_minutes", e.target.value)} /></label>
@@ -592,10 +966,12 @@ function Settings() {
         rule in these groups fires: {policy.alerts.rule_triggers.join(", ")}. Analysts: {policy.alerts.analysts.join(", ")}.
         Response-time targets in minutes by priority: {LEVELS.map((_, i) => `P${i + 1} ${policy.alerts.sla_minutes[String(i + 1)]}`).join(", ")}.
       </p>
-      <div className="actions"><button className="on" onClick={save}>Save</button> <span>{msg}</span></div>
+      <div className="actions"><button className="primary" onClick={save}>Save</button> <span>{msg}</span></div>
     </div>
   );
 }
+
+// ---- people and audit -----------------------------------------------------------------
 
 const ROLES: Role[] = ["VIEWER", "ANALYST", "ADMIN"];
 
@@ -612,13 +988,14 @@ function Admin({ me }: { me: Me }) {
     try { await fn(); setMsg(`${what}: done.`); } catch (e) { setMsg(`${what}: ${(e as Error).message}`); }
     load();
   };
+  const reportsMfa = users.some((u) => u.mfa_enabled !== undefined);
   return (
     <div className="grid2">
       <div className="panel">
-        <h3>People <span className="muted">who can sign in, and what they may do</span></h3>
+        <div className="panel-head"><h3>People</h3><span className="muted small">who can sign in, and what they may do</span></div>
         {msg && <div className="notice" role="status">{msg}</div>}
         <table data-testid="users">
-          <thead><tr><th>Username</th><th>Role</th><th>Status</th><th></th></tr></thead>
+          <thead><tr><th>Username</th><th>Role</th>{reportsMfa && <th>Sign-in</th>}<th>Status</th><th></th></tr></thead>
           <tbody>{users.map((u) => (
             <tr key={u.username}>
               <td className="mono">{u.username}{u.username === me.username && <span className="muted"> (you)</span>}</td>
@@ -628,8 +1005,18 @@ function Admin({ me }: { me: Me }) {
                   {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
                 </select>
               </td>
-              <td>{u.active ? "Active" : "Deactivated"}</td>
-              <td className="r">
+              {reportsMfa && (
+                <td>
+                  {u.sso ? <span className="state ok">SSO</span> : null}{" "}
+                  <span className={`state ${u.mfa_enabled ? "ok" : "off"}`}>{u.mfa_enabled ? "2FA on" : "password only"}</span>
+                </td>
+              )}
+              <td>{u.active ? "Active" : <span className="muted">Deactivated</span>}</td>
+              <td className="r row-actions">
+                {u.mfa_enabled && (
+                  <button onClick={() => { if (window.confirm(`Reset two-step verification for ${u.username}? They will sign in with a password only until they set it up again.`))
+                    run(`Reset 2FA for ${u.username}`, () => api.changeUser(u.username, { reset_mfa: true })); }}>Reset 2FA</button>
+                )}
                 <button onClick={() => run(`${u.active ? "Deactivate" : "Reactivate"} ${u.username}`, () => api.changeUser(u.username, { active: !u.active }))}>
                   {u.active ? "Deactivate" : "Reactivate"}
                 </button>
@@ -647,44 +1034,140 @@ function Admin({ me }: { me: Me }) {
             <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as Role })}>
               {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
             </select></label>
-          <div className="actions"><button className="on" type="submit" disabled={!form.username || form.password.length < 10}>Add person</button></div>
+          <div className="actions"><button className="primary" type="submit" disabled={!form.username || form.password.length < 10}>Add person</button></div>
         </form>
         <p className="muted">Viewer: read only. Analyst: can also work alerts. Admin: can also change settings, import data and manage people.
           Changing a role or deactivating someone signs them out everywhere.</p>
       </div>
       <div className="panel">
-        <div className="panel-head"><h3>Audit log <span className="muted">latest {audit.length} entries, newest first</span></h3>
+        <div className="panel-head"><h3>Audit log</h3><span className="muted small grow">latest {audit.length} entries, newest first</span>
           <button onClick={load}>Refresh</button></div>
-        <table className="compact" data-testid="audit">
-          <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
-          <tbody>{audit.map((a) => (
-            <tr key={a.id}>
-              <td>{new Date(a.at).toLocaleString()}</td><td className="mono">{a.actor}</td><td>{a.action.replace(/_/g, " ").toLowerCase()}</td>
-              <td className="mono">{a.target ?? ""}</td>
-              <td className="small mono">{Object.keys(a.detail).length ? JSON.stringify(a.detail) : ""}</td>
-            </tr>
-          ))}</tbody>
-        </table>
+        <div className="table-wrap tall">
+          <table className="compact" data-testid="audit">
+            <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
+            <tbody>{audit.map((a) => (
+              <tr key={a.id}>
+                <td>{new Date(a.at).toLocaleString()}</td><td className="mono">{a.actor}</td><td>{a.action.replace(/_/g, " ").toLowerCase()}</td>
+                <td className="mono">{a.target ?? ""}</td>
+                <td className="small mono">{Object.keys(a.detail).length ? JSON.stringify(a.detail) : ""}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
         {audit.length === 0 && <div className="empty">No entries yet.</div>}
       </div>
     </div>
   );
 }
 
+// ---- security (own two-step verification) -----------------------------------------------
+
+function Security({ me }: { me: Me }) {
+  const [state, setState] = useState<"loading" | "missing" | "off" | "setup" | "codes" | "on">("loading");
+  const [setup, setSetup] = useState<{ secret: string; uri: string; qr: string } | null>(null);
+  const [codes, setCodes] = useState<string[]>([]);
+  const [code, setCode] = useState("");
+  const [password, setPassword] = useState("");
+  const [msg, setMsg] = useState("");
+  const refresh = useCallback(() => {
+    api.mfaStatus().then((s) => setState(s.enabled ? "on" : "off")).catch((e) => { setState(notFound(e) ? "missing" : "off"); if (!notFound(e)) setMsg((e as Error).message); });
+  }, []);
+  useEffect(refresh, [refresh]);
+  const begin = async () => {
+    setMsg("");
+    try {
+      const s = await api.mfaSetup();
+      const qr = await QRCode.toDataURL(s.otpauth_uri, { margin: 1, width: 192, color: { dark: "#111418", light: "#ffffff" } });
+      setSetup({ secret: s.secret, uri: s.otpauth_uri, qr }); setCode(""); setState("setup");
+    } catch (e) { setMsg((e as Error).message); }
+  };
+  const enable = async (e: React.FormEvent) => {
+    e.preventDefault(); setMsg("");
+    try { const r = await api.mfaEnable(code.trim()); setCodes(r.recovery_codes); setSetup(null); setCode(""); setState("codes"); }
+    catch (err) { setMsg((err as Error).message.startsWith("4") ? "That code was not accepted. Check the time on your phone and try the next code." : (err as Error).message); }
+  };
+  const disable = async (e: React.FormEvent) => {
+    e.preventDefault(); setMsg("");
+    try { await api.mfaDisable(password, code.trim()); setPassword(""); setCode(""); setState("off"); setMsg("Two-step verification is off."); }
+    catch (err) { setMsg((err as Error).message.startsWith("4") ? "Password or code not accepted." : (err as Error).message); }
+  };
+  return (
+    <div className="panel narrow">
+      <div className="panel-head"><h3>Two-step verification</h3><span className="muted small">for {me.username}</span></div>
+      {state === "loading" && <div className="empty">Loading.</div>}
+      {state === "missing" && <div className="empty">This server does not support two-step verification yet. Update the API to enable it.</div>}
+      {state === "off" && (
+        <>
+          <p>Off. Signing in needs only your password.</p>
+          <p className="muted">With it on, signing in also needs a 6-digit code from an authenticator app such as Google Authenticator, Microsoft Authenticator or 1Password.</p>
+          <div className="actions"><button className="primary" onClick={begin}>Set up</button></div>
+        </>
+      )}
+      {state === "setup" && setup && (
+        <form onSubmit={enable}>
+          <ol className="steps">
+            <li>Scan this code with your authenticator app.
+              <div className="qr"><img src={setup.qr} width={192} height={192} alt="QR code for your authenticator app" /></div>
+              <span className="muted">Cannot scan it? Enter this key instead: </span><code className="secret">{setup.secret}</code>
+            </li>
+            <li>Type the 6-digit code the app shows.
+              <label className="inline">Code<input autoFocus inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(e) => setCode(e.target.value)} /></label>
+            </li>
+          </ol>
+          <div className="actions">
+            <button className="primary" type="submit" disabled={code.trim().length < 6}>Turn on</button>
+            <button type="button" onClick={() => { setSetup(null); setState("off"); }}>Cancel</button>
+          </div>
+        </form>
+      )}
+      {state === "codes" && (
+        <>
+          <p><b>On.</b> Save these recovery codes somewhere safe. Each one signs you in once if you lose your phone. They are shown only now.</p>
+          <ul className="codes mono">{codes.map((c) => <li key={c}>{c}</li>)}</ul>
+          <div className="actions">
+            <button onClick={() => { navigator.clipboard?.writeText(codes.join("\n")).then(() => setMsg("Copied."), () => setMsg("Copy failed; select and copy them by hand.")); }}>Copy codes</button>
+            <button className="primary" onClick={() => { setCodes([]); setState("on"); }}>I have saved them</button>
+          </div>
+        </>
+      )}
+      {state === "on" && (
+        <form onSubmit={disable}>
+          <p><b>On.</b> Signing in needs your password and a code from your authenticator app.</p>
+          <h4>Turn off</h4>
+          <div className="form">
+            <label>Password<input type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+            <label>Current code<input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(e) => setCode(e.target.value)} /></label>
+          </div>
+          <div className="actions"><button className="danger" type="submit" disabled={!password || code.trim().length < 6}>Turn off</button></div>
+        </form>
+      )}
+      {msg && <p className="notice" role="status">{msg}</p>}
+    </div>
+  );
+}
+
+// ---- transaction drawer ---------------------------------------------------------------
+
 function TxnDrawer({ id, onClose }: { id: string; onClose: () => void }) {
   const [t, setT] = useState<TxnDetail | null>(null);
   const [err, setErr] = useState("");
   useEffect(() => { setT(null); api.transaction(id).then(setT).catch((e) => setErr(String(e.message))); }, [id]);
+  useEffect(() => {
+    const k = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", k);
+    return () => window.removeEventListener("keydown", k);
+  }, [onClose]);
   return (
-    <aside className="drawer">
+    <aside className="drawer glass" aria-label="Transaction detail">
       <div className="panel-head"><h3>Transaction</h3><button onClick={onClose}>Close</button></div>
       {err && <div className="error">{err}</div>}
       {t && (
         <>
           <p className="mono">{t.transaction_id}</p>
-          <p><SourceBadge source={t.source} /> <LevelBadge level={t.risk_level} /> · {t.decision}</p>
+          <p><SourceBadge source={t.source} /> <LevelBadge level={t.risk_level} /> <span className={`decision d-${t.decision}`}>{t.decision}</span></p>
+          <ScoreRing score={t.risk_score} level={t.risk_level} />
           <table className="compact"><tbody>
-            <tr><td>Risk probability</td><td className="r">{t.risk_score.toFixed(6)}</td></tr>
+            <tr><td>Risk score</td><td className="r">{t.risk_score.toFixed(6)}</td></tr>
             <tr><td>Model version</td><td className="r">{t.model_version}</td></tr>
             <tr><td>Amount</td><td className="r">{inr(t.amount)} {t.txn_type}</td></tr>
             <tr><td>Account → counterparty</td><td className="r mono">{t.account_id} → {t.counterparty_id}</td></tr>

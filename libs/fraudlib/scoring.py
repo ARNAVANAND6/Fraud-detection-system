@@ -39,6 +39,11 @@ FEATURE_REASON = {
 MAX_MODEL_REASONS = 3
 
 
+def _balance_unknown(features: dict[str, float]) -> bool:
+    v = features.get("amount_to_balance")
+    return v is None or v != v      # NaN
+
+
 class Scorer:
     """Loads a LightGBM model if present; otherwise scores with rules only.
 
@@ -92,6 +97,11 @@ class Scorer:
         rule_score, rule_codes = evaluate_rules(features)
         if self.booster is not None:
             risk = self._model_probability(features)
+            if _balance_unknown(features):
+                # The model was trained with balances and leans on them; without them it
+                # scores almost everything near zero. The rules still see velocity, novelty
+                # and amount, so they set the floor for these events.
+                risk = max(risk, rule_score)
             # A low score needs no model explanation.
             model_codes = self._model_reasons(features) if risk >= thresholds.medium else []
         else:
