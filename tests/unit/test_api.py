@@ -15,10 +15,13 @@ from fraudlib.features import RedisFeatureStore
 from fraudlib.policy import Policy
 from fraudlib.scoring import Scorer
 
+from services.scorer.app.auth import hash_password, verify_password
 from services.scorer.app.gateway import Gateway, verify_webhook
 from services.scorer.app.main import app
 
 KEY = {"X-API-Key": "test-key"}
+PASSWORD = "correct-horse-battery"
+PASSWORD_HASH = hash_password(PASSWORD)  # hashed once: scrypt is slow on purpose
 SECRET = "test-webhook-secret"
 EVENT = {"transaction_id": "TXN_1", "event_time": "2026-01-01T00:00:00+00:00", "account_id": "C1",
          "counterparty_id": "C2", "txn_type": "TRANSFER", "amount": 900.0, "old_balance_orig": 900.0,
@@ -46,8 +49,61 @@ class FakeProducer:
 
 
 class FakeRepo:
+    """In-memory stand-in for the PostgreSQL repository, with the same rules for users and sessions."""
+
     def __init__(self):
         self.policy = Policy()
+        self.users, self.sessions, self.audit_rows, self.alert_updates = {}, {}, [], []
+
+    def get_user(self, username):
+        return self.users.get(username)
+
+    def list_users(self):
+        return [{k: v for k, v in u.items() if k != "password_hash"} for u in self.users.values()]
+
+    def create_user(self, username, password_hash, role):
+        if username in self.users:
+            return False
+        self.users[username] = {"username": username, "password_hash": password_hash, "role": role, "active": True}
+        return True
+
+    def update_user(self, username, role, active, password_hash):
+        u = self.users.get(username)
+        if u is None:
+            return None
+        loses_admin = u["role"] == "ADMIN" and u["active"] and (
+            (role is not None and role != "ADMIN") or active is False)
+        others = [o for n, o in self.users.items() if n != username and o["role"] == "ADMIN" and o["active"]]
+        if loses_admin and not others:
+            raise ValueError("this is the last active administrator")
+        changed_role = role is not None and role != u["role"]
+        u.update({k: v for k, v in (("role", role), ("active", active), ("password_hash", password_hash))
+                  if v is not None})
+        if active is False or password_hash is not None or changed_role:
+            self.sessions = {t: n for t, n in self.sessions.items() if n != username}
+        return {k: v for k, v in u.items() if k != "password_hash"}
+
+    def create_session(self, token_sha256, username, expires_at):
+        self.sessions[token_sha256] = username
+
+    def get_session_user(self, token_sha256):
+        u = self.users.get(self.sessions.get(token_sha256))
+        return {"username": u["username"], "role": u["role"]} if u and u["active"] else None
+
+    def delete_session(self, token_sha256):
+        self.sessions.pop(token_sha256, None)
+
+    def audit(self, actor, role, action, target, detail, ip):
+        self.audit_rows.append({"actor": actor, "role": role, "action": action, "target": target, "detail": detail})
+
+    def list_audit(self, limit):
+        return self.audit_rows[::-1][:limit]
+
+    def update_alert(self, alert_id, to_status, assign_to, actor, notes):
+        self.alert_updates.append((alert_id, to_status, actor))
+        return {"alert_id": alert_id, "status": to_status, "account_id": "C1", "priority": 1, "trigger_types": [],
+                "reason_codes": [], "max_risk_score": 0.9, "event_count": 1, "assigned_to": assign_to,
+                "escalation_level": 0, "sla_due_at": None, "created_at": None, "updated_at": None}
 
     def ping(self):
         return True
@@ -66,11 +122,14 @@ class FakeRepo:
 def make_client(monkeypatch, tmp_path, environment="demo", rate="1000"):
     monkeypatch.setenv("API_KEYS", "test-key")
     monkeypatch.setenv("WEBHOOK_SECRET", SECRET)
+    monkeypatch.setenv("ADMIN_PASSWORD", PASSWORD)
     monkeypatch.setenv("ENVIRONMENT", environment)
     monkeypatch.setenv("RATE_LIMIT_PER_MINUTE", rate)
     r = fakeredis.FakeRedis()
     st = app.state
     st.redis, st.store, st.scorer, st.repo = r, RedisFeatureStore(r), Scorer(tmp_path), FakeRepo()
+    for name, role in (("admin", "ADMIN"), ("asha", "ANALYST"), ("vik", "VIEWER")):
+        st.repo.create_user(name, PASSWORD_HASH, role)
     gw = Gateway.__new__(Gateway)
     gw.s, gw.redis, gw.producer, gw.ingest_ms = get_settings(), r, FakeProducer(), deque(maxlen=100)
     st.gateway = gw
@@ -91,6 +150,12 @@ def prod_client(tmp_path, monkeypatch):
         yield c
     for attr in ("redis", "store", "scorer", "repo", "gateway"):
         delattr(app.state, attr)
+
+
+def as_user(c, username="admin", password=PASSWORD) -> dict:
+    r = c.post("/v1/auth/login", json={"username": username, "password": password})
+    assert r.status_code == 200, r.text
+    return {"Authorization": f"Bearer {r.json()['token']}"}
 
 
 def sent(client_):
@@ -166,7 +231,8 @@ def test_csv_import_labels_rows_and_reports_bad_ones(client):
     rows = [header] + [f"IMP_{i},2026-01-01T00:00:0{i}+00:00,C{i},P1,PAYMENT,10.5,100,0" for i in range(3)]
     rows.append("IMP_BAD,2026-01-01T00:00:09+00:00,C9,P1,PAYMENT,-4,100,0")
     rows.append("IMP_0,2026-01-01T00:00:00+00:00,C0,P1,PAYMENT,10.5,100,0")  # duplicate inside the file
-    r = client.post("/v1/imports", headers=KEY, files={"file": ("t.csv", io.BytesIO("\n".join(rows).encode()))})
+    r = client.post("/v1/imports", headers=as_user(client),
+                    files={"file": ("t.csv", io.BytesIO("\n".join(rows).encode()))})
     assert r.status_code == 202, r.text
     body = r.json()
     assert (body["rows"], body["accepted"], body["duplicates"], body["invalid"]) == (5, 3, 1, 1)
@@ -179,19 +245,20 @@ def test_parquet_import(client):
 
     buf = io.BytesIO()
     pd.DataFrame([{**EVENT, "transaction_id": f"PQ_{i}"} for i in range(4)]).to_parquet(buf)
-    r = client.post("/v1/imports", headers=KEY, files={"file": ("t.parquet", io.BytesIO(buf.getvalue()))})
+    r = client.post("/v1/imports", headers=as_user(client), files={"file": ("t.parquet", io.BytesIO(buf.getvalue()))})
     assert r.status_code == 202 and r.json()["accepted"] == 4
-    assert client.post("/v1/imports", headers=KEY, files={"file": ("t.txt", io.BytesIO(b"x"))}).status_code == 415
+    r = client.post("/v1/imports", headers=as_user(client), files={"file": ("t.txt", io.BytesIO(b"x"))})
+    assert r.status_code == 415
 
 
 def test_demo_scenario_is_labelled_simulated(client):
-    r = client.post("/v1/demo/scenario", json={"scenario": "RAPID_BURST"}, headers=KEY)
+    r = client.post("/v1/demo/scenario", json={"scenario": "RAPID_BURST"}, headers=as_user(client))
     assert r.status_code == 202 and len(r.json()["transaction_ids"]) == 6
     assert {m[2]["source"] for m in sent(client)} == {"SIMULATED_DEMO"}
 
 
 def test_production_has_no_demo_scenario_and_uses_its_own_topics(prod_client):
-    assert prod_client.post("/v1/demo/scenario", json={}, headers=KEY).status_code == 404
+    assert prod_client.post("/v1/demo/scenario", json={}, headers=as_user(prod_client)).status_code == 404
     r = prod_client.post("/v1/transactions", json=EVENT, headers=KEY)
     assert r.status_code == 202 and r.headers["X-Vyrox-Environment"] == "production"
     assert sent(prod_client)[0][0] == "production.payments.transactions.v1"
@@ -206,6 +273,12 @@ def test_production_refuses_demo_credentials(monkeypatch):
     monkeypatch.setenv("WEBHOOK_SECRET", "demo-webhook-secret")
     with pytest.raises(RuntimeError):
         get_settings().assert_safe_for_production()
+    monkeypatch.setenv("API_KEYS", "a-real-key")
+    monkeypatch.setenv("WEBHOOK_SECRET", "a-real-secret")
+    with pytest.raises(RuntimeError, match="ADMIN_PASSWORD"):
+        get_settings().assert_safe_for_production()  # the demo administrator password alone is enough to refuse
+    monkeypatch.setenv("ADMIN_PASSWORD", "a-real-admin-password")
+    get_settings().assert_safe_for_production()
 
 
 def test_dry_run_score_contract_and_config(client):
@@ -214,12 +287,12 @@ def test_dry_run_score_contract_and_config(client):
     body = r.json()
     assert set(body) >= {"risk_score", "risk_level", "decision", "reason_codes", "model_version", "scored_at"}
     assert "BALANCE_DRAIN" in body["reason_codes"] and sent(client) == []
-    cfg = client.get("/v1/config", headers=KEY).json()
+    cfg, admin = client.get("/v1/config", headers=KEY).json(), as_user(client)
     cfg["thresholds"] = {"medium": 0.1, "high": 0.2, "critical": 0.3}
-    assert client.put("/v1/config", json=cfg, headers=KEY).status_code == 200
+    assert client.put("/v1/config", json=cfg, headers=admin).status_code == 200
     assert client.post("/v1/score", json=EVENT, headers=KEY).json()["risk_level"] == "CRITICAL"
     cfg["thresholds"] = {"medium": 0.5, "high": 0.2, "critical": 0.3}
-    assert client.put("/v1/config", json=cfg, headers=KEY).status_code == 422
+    assert client.put("/v1/config", json=cfg, headers=admin).status_code == 422
 
 
 def test_rate_limit(tmp_path, monkeypatch):
@@ -233,3 +306,88 @@ def test_rate_limit(tmp_path, monkeypatch):
 def test_health(client):
     assert client.get("/health/live").json() == {"status": "ok"}
     assert client.get("/health/ready").status_code == 200
+
+
+# ---- sign-in, roles, audit ---------------------------------------------------------
+def test_password_hashing():
+    assert PASSWORD_HASH.startswith("scrypt$") and PASSWORD not in PASSWORD_HASH
+    assert verify_password(PASSWORD, PASSWORD_HASH)
+    assert not verify_password(PASSWORD + "x", PASSWORD_HASH)
+    assert not verify_password(PASSWORD, "not-a-hash")
+    assert hash_password(PASSWORD) != PASSWORD_HASH  # salted
+
+
+def test_sign_in_and_out(client):
+    assert client.get("/v1/auth/me").status_code == 401
+    assert client.post("/v1/auth/login", json={"username": "asha", "password": "wrong-password"}).status_code == 401
+    assert client.post("/v1/auth/login", json={"username": "nobody", "password": PASSWORD}).status_code == 401
+    token = as_user(client, "asha")
+    assert client.get("/v1/auth/me", headers=token).json() == {"username": "asha", "role": "ANALYST"}
+    assert client.get("/v1/auth/me", headers=KEY).status_code == 403  # an API key is not a person
+    assert client.post("/v1/auth/logout", headers=token).status_code == 204
+    assert client.get("/v1/auth/me", headers=token).status_code == 401
+    actions = [(a["actor"], a["action"]) for a in app.state.repo.audit_rows]
+    assert ("asha", "LOGIN_FAILED") in actions and ("asha", "LOGIN") in actions and ("asha", "LOGOUT") in actions
+    assert PASSWORD not in json.dumps(app.state.repo.audit_rows)
+
+
+def test_repeated_failed_sign_ins_lock_out(client):
+    codes = [client.post("/v1/auth/login", json={"username": "admin", "password": "bad-password-x"}).status_code
+             for _ in range(6)]
+    assert codes == [401] * 5 + [429]
+    # Even the right password is refused while locked.
+    assert client.post("/v1/auth/login", json={"username": "admin", "password": PASSWORD}).status_code == 429
+
+
+def test_roles_limit_what_each_caller_can_do(client):
+    viewer, analyst, admin = as_user(client, "vik"), as_user(client, "asha"), as_user(client)
+    cfg = client.get("/v1/config", headers=viewer).json()  # everyone signed in can read
+    update = {"status": "IN_REVIEW"}
+    # Working an alert needs an analyst or admin, and never an API key.
+    assert client.patch("/v1/alerts/7", json=update, headers=viewer).status_code == 403
+    assert client.patch("/v1/alerts/7", json=update, headers=KEY).status_code == 403
+    assert client.patch("/v1/alerts/7", json=update, headers=analyst).status_code == 200
+    # Settings, imports, users and the audit log are admin only.
+    for who in (viewer, analyst, KEY):
+        assert client.put("/v1/config", json=cfg, headers=who).status_code == 403
+        assert client.get("/v1/users", headers=who).status_code == 403
+        assert client.get("/v1/audit", headers=who).status_code == 403
+    assert client.put("/v1/config", json=cfg, headers=admin).status_code == 200
+    # People below admin cannot push transactions; machines with a key can.
+    assert client.post("/v1/transactions", json=EVENT, headers=analyst).status_code == 403
+    assert client.post("/v1/transactions", json=EVENT, headers=KEY).status_code == 202
+    denied = [a for a in app.state.repo.audit_rows if a["action"] == "DENIED"]
+    assert {"actor": "vik", "target": "PATCH /v1/alerts/7"}.items() <= denied[0].items()
+
+
+def test_alert_changes_are_attributed_to_the_signed_in_person(client):
+    analyst = as_user(client, "asha")
+    r = client.patch("/v1/alerts/7", json={"status": "CONFIRMED_FRAUD", "actor": "someone-else"}, headers=analyst)
+    assert r.status_code == 200
+    assert app.state.repo.alert_updates == [(7, "CONFIRMED_FRAUD", "asha")]  # the body cannot choose the actor
+    last = app.state.repo.audit_rows[-1]
+    assert (last["actor"], last["action"], last["target"]) == ("asha", "ALERT_UPDATE", "7")
+
+
+def test_user_management(client):
+    admin = as_user(client)
+    new = {"username": "Meera", "password": "long-enough-pass", "role": "ANALYST"}
+    assert client.post("/v1/users", json={**new, "password": "short"}, headers=admin).status_code == 422
+    assert client.post("/v1/users", json={**new, "username": "x"}, headers=admin).status_code == 422
+    assert client.post("/v1/users", json=new, headers=admin).status_code == 201
+    assert client.post("/v1/users", json=new, headers=admin).status_code == 409
+    listed = client.get("/v1/users", headers=admin).json()
+    assert {u["username"] for u in listed} == {"admin", "asha", "vik", "meera"}
+    assert all("password_hash" not in u for u in listed)
+    meera = as_user(client, "meera", "long-enough-pass")
+    # Deactivating signs the person out at once.
+    assert client.patch("/v1/users/meera", json={"active": False}, headers=admin).status_code == 200
+    assert client.get("/v1/auth/me", headers=meera).status_code == 401
+    assert client.post("/v1/auth/login", json={"username": "meera", "password": "long-enough-pass"}).status_code == 401
+    # The last administrator cannot be demoted or deactivated.
+    assert client.patch("/v1/users/admin", json={"role": "VIEWER"}, headers=admin).status_code == 409
+    assert client.patch("/v1/users/admin", json={"active": False}, headers=admin).status_code == 409
+    assert client.patch("/v1/users/ghost", json={"active": False}, headers=admin).status_code == 404
+    audit = client.get("/v1/audit", headers=admin).json()
+    assert {"USER_CREATE", "USER_CHANGE"} <= {a["action"] for a in audit}
+    assert "long-enough-pass" not in json.dumps(audit)

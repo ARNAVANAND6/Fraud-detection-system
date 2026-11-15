@@ -103,15 +103,43 @@ On a small machine set `PIPELINE_MODE=direct` in `.env` and start with
 topic and Spark is not in the scoring path (start it separately with
 `make spark` if you want the lake).
 
+Sign in to the dashboard as `admin` with the password from `ADMIN_PASSWORD` in `.env`
+(`vyrox-demo-admin` in the demo file). Add named accounts for other people under the Admin tab.
+
 Send something yourself:
 
 ```bash
 curl -X POST localhost:8000/v1/transactions -H 'X-API-Key: dev-key' -H 'Content-Type: application/json' -d '{
   "transaction_id":"TXN_MINE_1","event_time":"2026-11-13T12:00:00+00:00","account_id":"C1",
   "counterparty_id":"M1","txn_type":"TRANSFER","amount":98000,"old_balance_orig":98500,"old_balance_dest":0}'
-curl -X POST localhost:8000/v1/demo/scenario -H 'X-API-Key: dev-key' -H 'Content-Type: application/json' \
-  -d '{"scenario":"RAPID_BURST"}'        # also ACCOUNT_TAKEOVER, UNUSUAL_AMOUNT
 ```
+
+Fraud scenarios (`RAPID_BURST`, `ACCOUNT_TAKEOVER`, `UNUSUAL_AMOUNT`) are injected from the Ingest tab,
+which needs an administrator.
+
+## Sign-in, roles and the audit log
+
+| Caller | How it authenticates | What it may do |
+|---|---|---|
+| Viewer | username and password | read everything |
+| Analyst | username and password | read, and work alerts (assign, review, confirm, dismiss) |
+| Admin | username and password | everything: settings, imports, demo scenarios, people, audit log |
+| Machine | `X-API-Key` | send transactions, dry-run scores, read. Nothing else. |
+
+- Passwords are stored as salted scrypt hashes, at least 10 characters. Five failed sign-ins for one
+  username from one address lock that pair out for 15 minutes.
+- A sign-in returns a random session token valid for 8 hours. Only its SHA-256 digest is stored.
+  Deactivating a person, changing their role or resetting their password ends their sessions at once.
+- The browser holds the token for the life of the tab. No API key is built into the dashboard any more.
+- An alert change is recorded under the signed-in person's name; the request cannot choose the actor.
+- `audit_log` records every sign-in, failed sign-in, refused request, alert change, settings change
+  (with before and after values), import, demo scenario and change to a user. The API only appends to it.
+- The last active administrator cannot be demoted or deactivated.
+
+What this is not: there is no single sign-on, no multi-factor sign-in and no TLS in this repository.
+Tokens and passwords cross the network in plain HTTP unless a TLS proxy is put in front, so as shipped
+it is only suitable for localhost. Database users can still alter `audit_log`; making it tamper-evident
+needs restricted database roles or an external log store.
 
 ## Risk levels, decisions and alerts
 
@@ -246,7 +274,8 @@ the training data.
 - Dashboard analytics run aggregate queries over the whole `predictions` table every 2 seconds. Fine for a demo, not for millions of rows.
 - The fan-in feature shares state across accounts; with several scorer replicas two senders to one destination scored at the same instant can miss each other.
 - The risk score is an uncalibrated model probability.
-- The dashboard API key is public by nature. Production needs analyst sign-in.
+- Sign-in is username and password only: no single sign-on, no multi-factor, and no TLS in this repository.
+- Login lock-out and rate limits are held in the API process, so they reset on restart and are per replica.
 - "Spark backlog" on the dashboard is an approximation from topic offsets.
 - Not done from the original plan: PaySim and IEEE-CIS training, Airflow, dbt, MLflow registry, AWS deployment.
 
