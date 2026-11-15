@@ -1,0 +1,52 @@
+# Two of every application process, so losing one does not stop the service.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ha.yml --profile app --profile tls up -d
+#   (set DASHBOARD_API_URL= in .env so the dashboard calls the proxy, which spreads requests over both APIs)
+#
+# - api and api-2 sit behind the Caddy proxy, which checks each one every 2 seconds and stops
+#   sending to one that does not answer. Sessions, lock-outs and rate limits live in PostgreSQL
+#   and Redis, so a person stays signed in when their requests move to the other API. A
+#   dashboard's live stream reconnects by itself.
+# - scorer and scorer-2 share the scoring work through one Kafka consumer group. If one stops,
+#   Kafka gives its partitions to the other within SCORER_SESSION_TIMEOUT_MS (10 s), and it
+#   carries on from the last committed offset: nothing is lost, a few events may be scored twice
+#   and the duplicate is skipped.
+#
+# Kafka, Redis and PostgreSQL are still one container each here. See docs/DEPLOYMENT.md for
+# running those on several machines (managed services, or clusters).
+x-python: &python
+  image: vyrox-python:dev
+  env_file: .env
+  restart: unless-stopped
+  depends_on:
+    kafka-init: { condition: service_completed_successfully }
+    redis: { condition: service_healthy }
+    postgres: { condition: service_healthy }
+
+services:
+  scorer:
+    environment: { NODE_ID: scorer-1 }
+
+  scorer-2:
+    <<: *python
+    profiles: [app]
+    environment: { NODE_ID: scorer-2 }
+    command: ["python", "-m", "services.scorer.app.consumer"]
+
+  api:
+    environment: { NODE_ID: api-1 }
+
+  api-2:
+    <<: *python
+    profiles: [app]
+    environment: { NODE_ID: api-2 }
+    command: ["uvicorn", "services.scorer.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1",
+              "--timeout-graceful-shutdown", "3"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"]
+      interval: 10s
+
+  proxy:
+    environment:
+      API_UPSTREAM: "api:8000 api-2:8000"
+    depends_on: [api, api-2, dashboard]

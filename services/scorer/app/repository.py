@@ -44,7 +44,9 @@ class Repository:
         """Create the auth tables if missing (older databases predate them) and the first admin."""
         from .auth import AUTH_SCHEMA
 
-        with self.pool.connection() as c:
+        with self.pool.connection() as c, c.transaction():
+            # Several API replicas can start at once; one at a time changes the schema.
+            c.execute("SELECT pg_advisory_xact_lock(7461)")
             c.execute(AUTH_SCHEMA)
             c.execute("INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'ADMIN') "
                       "ON CONFLICT (username) DO NOTHING", (admin_username, admin_password_hash))

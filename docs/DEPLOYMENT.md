@@ -1,8 +1,9 @@
 # Deployment and operations
 
-How to run VYROX on one server for a pilot, and how to look after it. This is
-a single-node deployment. It has no high availability: if the server stops,
-scoring stops until it is back (nothing accepted is lost, see Recovery).
+How to run VYROX for a pilot, and how to look after it. The application processes (API and scorer) can
+run two or more of each, so losing one does not stop the service (see "Several servers"). Kafka, Redis and
+PostgreSQL as shipped are one container each: if one of those stops, scoring stops until it is back
+(nothing accepted is lost, see Recovery).
 
 ## What you need
 
@@ -77,8 +78,55 @@ per second (`reports/loadtest.json`). The limit is the scorer: it handles one ev
 transaction each. Run the load test on your own server before committing to a volume; it only runs in the demo
 environment because it writes simulated transactions.
 
-Not built: more than one API replica (the live stream is held in one process), and tested scale-out of the
-scorer (the topic has partitions for it, but the fan-in feature can miss simultaneous events across replicas).
+## Several servers
+
+`docker-compose.ha.yml` runs two APIs and two scorers:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.ha.yml --profile app --profile tls up -d
+```
+
+What makes that safe:
+
+- Sessions, two-factor challenges and SSO sign-ins are in PostgreSQL; lock-outs and API-key rate limits are in
+  Redis. Any API can serve any request, and a person stays signed in when one API stops.
+- The proxy spreads requests over the APIs, checks each one's `/health/live` every 2 seconds, and retries a
+  failed request on another API for up to 5 seconds.
+- Every API reads the scored-events topic with its own consumer group, so each one can feed live dashboards.
+  A dashboard's live stream reconnects by itself to whichever API answers.
+- The scorers share one consumer group. Kafka moves a stopped scorer's partitions to the others within
+  `SCORER_SESSION_TIMEOUT_MS` (10 seconds); they resume from the last committed offset. Events in flight
+  may be scored twice; the second copy is recognised and skipped.
+- Each process reports itself in Redis every second. `GET /v1/status` lists them under `nodes` (alive or not,
+  last seen, and for scorers how many partitions they hold), and a node that stopped in the last 10 minutes is
+  named in `reasons`.
+- Schema changes at start-up take a database lock, so replicas starting together do not collide.
+
+Measured on the test machine, 15 Nov 2026, Spark mode, simulator at its default rate, `/v1/status` polled
+through the proxy twice a second for 140 seconds (271 requests), `docker kill` (no clean shutdown):
+
+| Step | What happened |
+|---|---|
+| Kill `api-1` at 20 s | 0 failed requests. `api-2` answered all 145 requests until `api-1` was back. |
+| Kill `scorer-1` at 45 s | `scorer-2` took all 9 partitions 14.5 s later. Lag peaked at 336 events and was back to 0 within 2 s of the hand-over. The stream status stayed LIVE throughout, because `scorer-2` kept scoring its own partitions. |
+| Start both again at 95 s | Both rejoined within 5 s; the proxy went back to alternating (41 and 46 requests) and the partitions split 5 and 4. |
+
+So, during a scorer failure, accounts on the failed scorer's partitions are scored up to about 15 seconds late.
+Nothing was lost.
+
+Still one of each, and what to use instead for a pilot that must survive losing a machine:
+
+| Store | As shipped | For several machines |
+|---|---|---|
+| Kafka | 1 broker, replication factor 1 | 3 brokers, `--replication-factor 3`, `min.insync.replicas=2` (or a managed Kafka) |
+| PostgreSQL | 1 container | A managed database with a standby (RDS, Cloud SQL, Azure) or Patroni |
+| Redis | 1 container | Redis Sentinel or a managed Redis. Redis holds feature history; losing it degrades the velocity features until history rebuilds, it does not lose transactions |
+
+These were not built or tested here. The application only needs their addresses (`KAFKA_BOOTSTRAP`,
+`DATABASE_URL`, `REDIS_URL`).
+
+The fan-in feature (distinct senders to one destination in the last hour) is shared across accounts. With
+several scorers, two senders paying the same destination at the same instant can each miss the other.
 
 ## Monitoring
 

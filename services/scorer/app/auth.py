@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from fastapi import Header, HTTPException, Request
+from redis.exceptions import RedisError
 
 ROLES = ("VIEWER", "ANALYST", "ADMIN")
 SERVICE = "SERVICE"  # an API key, not a person
@@ -131,26 +132,54 @@ def token_digest(token: str) -> str:
 
 
 class LoginThrottle:
-    """Locks a username + address pair after repeated failures. In-process, like RateLimiter."""
+    """Locks a username + address pair after repeated failures.
 
-    def __init__(self, max_failures: int = 5, window_s: int = 900):
-        self.max_failures, self.window_s = max_failures, window_s
+    Kept in Redis so every API replica sees the same count and a restart does not
+    reset it. If Redis is unreachable it falls back to this process's memory.
+    """
+
+    def __init__(self, redis=None, max_failures: int = 5, window_s: int = 900):
+        self.redis, self.max_failures, self.window_s = redis, max_failures, window_s
         self.failures: dict[str, deque] = defaultdict(deque)
 
+    @staticmethod
+    def _key(key: str) -> str:
+        return "lt:" + hashlib.sha256(key.encode()).hexdigest()[:32]
+
     def _prune(self, key: str) -> deque:
-        q, now = self.failures[key], time.monotonic()
+        q, now = self.failures[key], time.time()
         while q and now - q[0] > self.window_s:
             q.popleft()
         return q
 
     def locked(self, key: str) -> bool:
+        if self.redis is not None:
+            try:
+                return self.redis.zcount(self._key(key), time.time() - self.window_s, "+inf") >= self.max_failures
+            except RedisError:
+                pass
         return len(self._prune(key)) >= self.max_failures
 
     def fail(self, key: str) -> None:
-        self._prune(key).append(time.monotonic())
+        now = time.time()
+        self._prune(key).append(now)
+        if self.redis is not None:
+            try:
+                p = self.redis.pipeline(transaction=True)
+                p.zadd(self._key(key), {f"{now:.6f}|{secrets.token_hex(4)}": now})
+                p.zremrangebyscore(self._key(key), "-inf", now - self.window_s)
+                p.expire(self._key(key), self.window_s)
+                p.execute()
+            except RedisError:
+                pass
 
     def clear(self, key: str) -> None:
         self.failures.pop(key, None)
+        if self.redis is not None:
+            try:
+                self.redis.delete(self._key(key))
+            except RedisError:
+                pass
 
 
 @dataclass(frozen=True)

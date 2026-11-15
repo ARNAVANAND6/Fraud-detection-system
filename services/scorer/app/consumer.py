@@ -31,12 +31,12 @@ from fraudlib.scoring import Scorer
 from prometheus_client import start_http_server
 from pydantic import ValidationError
 
+from . import nodes
 from .metrics import ALERTS, EVENTS, FEATURE_SECONDS, INFERENCE_SECONDS, PIPELINE_SECONDS, RETRIES
 from .repository import Repository, connect_with_retry
 
 log = logging.getLogger("scorer")
 INFRA_ERRORS = (psycopg.OperationalError, psycopg.InterfaceError, redis.ConnectionError, redis.TimeoutError)
-HEARTBEAT_KEY = "hb:scorer"
 MAX_ATTEMPTS = 3
 # Commit failures that mean "this consumer left the group", not data loss.
 REJOIN_ERRORS = {KafkaError._ASSIGNMENT_LOST, KafkaError._NO_OFFSET, KafkaError.ILLEGAL_GENERATION,
@@ -66,11 +66,16 @@ class ScoringWorker:
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",
             "isolation.level": "read_committed",
+            # With several scorers, a scorer that dies without leaving the group has its
+            # partitions moved to the others after this long (librdkafka's default is 45 s).
+            "session.timeout.ms": self.s.scorer_session_timeout_ms,
+            "heartbeat.interval.ms": max(1000, self.s.scorer_session_timeout_ms // 3),
         })
         self.running = True
         self.processed = self.duplicates = 0
         self.last_received_at: datetime | None = None
-        self._last_policy = self._last_escalation = 0.0
+        self._last_policy = self._last_escalation = self._last_beat = 0.0
+        self.node = nodes.node_id()
 
     # ---- helpers ----------------------------------------------------------------
     def dead_letter(self, msg, error: str) -> None:
@@ -81,11 +86,20 @@ class ScoringWorker:
         log.warning("dead-lettered event", extra={"error": error[:300], "origin_offset": msg.offset()})
 
     def heartbeat(self) -> None:
+        """Tell the API this scorer is alive (see nodes.py). At most once a second."""
+        now = time.monotonic()
+        if now - self._last_beat < 1:
+            return
+        self._last_beat = now
         try:
-            self.redis.set(HEARTBEAT_KEY, jsonlog.dumps({
-                "at": datetime.now(UTC), "model_version": self.scorer.model_version,
-                "processed": self.processed, "duplicates": self.duplicates,
-                "last_received_at": self.last_received_at, "pipeline_mode": self.s.pipeline_mode}), ex=6)
+            partitions = len(self.consumer.assignment())
+        except KafkaException:
+            partitions = None
+        try:
+            nodes.beat(self.redis, "scorer", self.node, {
+                "model_version": self.scorer.model_version, "processed": self.processed,
+                "duplicates": self.duplicates, "last_received_at": self.last_received_at,
+                "pipeline_mode": self.s.pipeline_mode, "partitions": partitions})
         except redis.RedisError:
             pass
 
@@ -227,6 +241,10 @@ class ScoringWorker:
                 log.error("housekeeping failed", extra={"error": str(exc)[:200]})
             self.producer.poll(0)
         self.consumer.close()
+        try:
+            nodes.leave(self.redis, "scorer", self.node)
+        except redis.RedisError:
+            pass
         self.repo.close()
         log.info("scorer stopped")
 

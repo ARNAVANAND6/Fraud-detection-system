@@ -145,7 +145,8 @@ which needs an administrator.
   (with before and after values), import, demo scenario and change to a user. The API only appends to it.
 - The last active administrator cannot be demoted or deactivated.
 
-What this is not: there is no single sign-on and no multi-factor sign-in. Database users can still alter
+Two-factor sign-in (authenticator app) and single sign-on (OpenID Connect) are described in
+[docs/SECURITY.md](docs/SECURITY.md). Database users can still alter
 `audit_log`; making it tamper-evident needs restricted database roles or an external log store.
 
 ## HTTPS
@@ -313,15 +314,14 @@ the training data.
 ## Known gaps
 
 - No real payment-gateway adapter and no live UPI, bank or card data.
-- The SSE hub is in process memory: run one API worker. More replicas need Redis pub/sub or one Kafka consumer per replica (already how events arrive).
+- Each API process runs one worker. For more capacity or failover run more API processes (docker-compose.ha.yml); each gets live events from Kafka itself.
 - Dashboard analytics run aggregate queries over the whole `predictions` table every 2 seconds. Fine for a demo, not for millions of rows.
 - The fan-in feature shares state across accounts; with several scorer replicas two senders to one destination scored at the same instant can miss each other.
 - The risk score is an uncalibrated model probability.
-- Sign-in is username and password only: no single sign-on and no multi-factor.
-- Single node: no high availability, no encryption at rest, no TLS between the internal services.
+- No SAML single sign-on (OpenID Connect only) and no hardware security keys.
+- API and scorer run two or more of each (docker-compose.ha.yml, failover measured in docs/DEPLOYMENT.md), but Kafka, Redis and PostgreSQL as shipped are one container each. No encryption at rest, no TLS between the internal services.
 - No certification or compliance work (ISO 27001, SOC 2, PCI DSS, RBI, DPDP) and no penetration test.
 - No synchronous approve-or-decline call: scoring is asynchronous, for review after submission.
-- Login lock-out and rate limits are held in the API process, so they reset on restart and are per replica.
 - "Spark backlog" on the dashboard is an approximation from topic offsets.
 - PaySim results (all 6.3 million rows) are in docs/MODEL_CARD.md. They show the pipeline scales, not real accuracy.
 - Not done from the original plan: IEEE-CIS training, Airflow, dbt, MLflow registry, AWS deployment.

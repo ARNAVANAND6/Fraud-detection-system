@@ -68,6 +68,7 @@ class Settings:
         default_factory=lambda: tuple(_env("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(","))
     )
     lag_delayed_threshold: int = field(default_factory=lambda: int(_env("LAG_DELAYED_THRESHOLD", "500")))
+    scorer_session_timeout_ms: int = field(default_factory=lambda: int(_env("SCORER_SESSION_TIMEOUT_MS", "10000")))
     idle_after_seconds: int = field(default_factory=lambda: int(_env("IDLE_AFTER_SECONDS", "15")))
 
     def __post_init__(self) -> None:
