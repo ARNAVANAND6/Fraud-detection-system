@@ -25,7 +25,7 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { ...authHeaders(), ...((init?.headers as Record<string, string>) ?? {}) };
   if (typeof init?.body === "string") headers["Content-Type"] = "application/json";
   const res = await fetch(`${BASE}${path}`, { ...init, headers });
-  if (res.status === 401 && path !== "/v1/auth/login") session.expired();
+  if (res.status === 401 && !path.startsWith("/v1/auth/login")) session.expired();
   if (!res.ok) {
     let detail = await res.text();
     try { const d = JSON.parse(detail).detail; detail = typeof d === "string" ? d : JSON.stringify(d); } catch { /* keep text */ }
@@ -88,8 +88,25 @@ export interface Status {
   model_version: string | null; duplicates_skipped: number | null; consumer_lag: number | null;
   spark_backlog: number | null; last_event_at: string | null; last_inference_at: string | null;
   seconds_since_last_event: number | null; active_sources: Source[]; dashboard_clients: number;
+  /** Present when the server runs as more than one process; absent on older servers. */
+  node?: string;
+  nodes?: { id: string; kind: "api" | "scorer"; alive: boolean; last_seen: string | null; partitions?: number | null }[];
 }
-export interface User { username: string; role: Role; active: boolean; created_at?: string; updated_at?: string }
+export interface User {
+  username: string; role: Role; active: boolean; created_at?: string; updated_at?: string;
+  mfa_enabled?: boolean; sso?: boolean;
+}
+export interface Connector {
+  name: string; kind: string; path: string; enabled: boolean; balance_known: boolean; last_event_at: string | null;
+  events_24h: number; last_error: string | null; last_error_at: string | null;
+}
+export interface Connectors { connectors: Connector[]; alert_webhook_configured: boolean }
+export interface ScoreResult {
+  transaction_id: string; risk_score: number; risk_level: RiskLevel; decision: "ALLOW" | "REVIEW" | "HOLD";
+  reason_codes: string[]; model_version: string; scored_at: string; latency_ms: number | null; disclaimer?: string;
+}
+/** A sign-in either finishes or asks for a second factor. */
+export type LoginResult = { kind: "done"; me: Me } | { kind: "mfa"; mfaToken: string; expiresIn: number };
 export interface AuditRow {
   id: number; at: string; actor: string; role: string; action: string; target: string | null;
   detail: Record<string, unknown>; ip: string | null;
@@ -110,17 +127,36 @@ export interface Drift {
 }
 
 export const api = {
-  login: async (username: string, password: string) => {
-    const r = await call<Me & { token: string }>("/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
+  login: async (username: string, password: string): Promise<LoginResult> => {
+    const r = await call<(Me & { token: string }) | { mfa_required: true; mfa_token: string; expires_in: number }>(
+      "/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
+    if ("mfa_required" in r) return { kind: "mfa", mfaToken: r.mfa_token, expiresIn: r.expires_in };
     session.set(r.token);
-    return { username: r.username, role: r.role } as Me;
+    return { kind: "done", me: { username: r.username, role: r.role } };
   },
+  loginMfa: async (mfaToken: string, code: string): Promise<Me> => {
+    const r = await call<Me & { token: string }>("/v1/auth/login/mfa", { method: "POST", body: JSON.stringify({ mfa_token: mfaToken, code }) });
+    session.set(r.token);
+    return { username: r.username, role: r.role };
+  },
+  /** Single sign-on, if the server has an identity provider configured. Older servers answer 404. */
+  sso: () => call<{ enabled: boolean; provider_name: string | null }>("/v1/auth/sso"),
+  ssoStartUrl: () => `${BASE}/v1/auth/sso/start`,
+  mfaStatus: () => call<{ enabled: boolean }>("/v1/auth/mfa"),
+  mfaSetup: () => call<{ secret: string; otpauth_uri: string }>("/v1/auth/mfa/setup", { method: "POST" }),
+  mfaEnable: (code: string) => call<{ recovery_codes: string[] }>("/v1/auth/mfa/enable", { method: "POST", body: JSON.stringify({ code }) }),
+  mfaDisable: (password: string, code: string) =>
+    call<void>("/v1/auth/mfa/disable", { method: "POST", body: JSON.stringify({ password, code }) }),
+  status: () => call<Status>("/v1/status"),
+  connectors: () => call<Connectors>("/v1/connectors"),
+  /** Dry run: the server scores the event with current features and stores nothing. */
+  score: (event: Record<string, unknown>) => call<ScoreResult>("/v1/score", { method: "POST", body: JSON.stringify(event) }),
   logout: async () => { try { await call<void>("/v1/auth/logout", { method: "POST" }); } finally { session.set(null); } },
   me: () => call<Me>("/v1/auth/me"),
   users: () => call<User[]>("/v1/users"),
   createUser: (username: string, password: string, role: Role) =>
     call<User>("/v1/users", { method: "POST", body: JSON.stringify({ username, password, role }) }),
-  changeUser: (username: string, body: { role?: Role; active?: boolean; password?: string }) =>
+  changeUser: (username: string, body: { role?: Role; active?: boolean; password?: string; reset_mfa?: boolean }) =>
     call<User>(`/v1/users/${encodeURIComponent(username)}`, { method: "PATCH", body: JSON.stringify(body) }),
   audit: () => call<AuditRow[]>("/v1/audit?limit=200"),
   drift: () => call<Drift>("/v1/model/drift"),
