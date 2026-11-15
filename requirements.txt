@@ -13,3 +13,6 @@ pandas==3.0.5
 numpy==2.5.3
 python-multipart==0.0.32
 pyarrow==26.0.1
+# Single sign-on (ID token signatures) and encryption of two-factor secrets.
+PyJWT==2.15.0
+cryptography==50.0.1

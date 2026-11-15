@@ -18,6 +18,17 @@ a recorded check. Nothing here is a certification.
 - Sessions: a random token, valid 8 hours. Only its SHA-256 digest is stored. Changing a person's role or
   password, or deactivating them, ends their sessions immediately.
 - The last active administrator cannot be demoted or deactivated.
+- **Two-factor sign-in** with any authenticator app (TOTP, RFC 6238). Secrets are encrypted at rest with a key
+  derived from `SECRET_KEY`; a code is accepted once, within one 30-second step of drift; five wrong codes end
+  the sign-in attempt. Ten single-use recovery codes are shown once and stored as SHA-256 digests. An
+  administrator can reset a lost authenticator. `MFA_REQUIRED_ROLES=ADMIN,ANALYST` makes it compulsory: a
+  person in those roles who has not enrolled can only enrol until they do.
+- **Single sign-on** with OpenID Connect (Google Workspace, Microsoft Entra ID, Okta, Keycloak and others):
+  authorization code flow with PKCE, state and nonce single use, ID token signature checked against the
+  provider's published keys (asymmetric algorithms only), issuer, audience and expiry checked, verified e-mail
+  required. People are matched by the provider's subject id, or by an e-mail an administrator set on their
+  account. Unknown people are refused unless their e-mail domain is in `OIDC_ALLOWED_DOMAINS`. Two-factor
+  sign-in for SSO users is enforced at the identity provider.
 - Production refuses to start with the demo API key, demo webhook secret or demo administrator password.
 
 ## Audit
@@ -53,7 +64,7 @@ as shipped; the compose file publishes their ports for development and those map
 
 These are the items a bank's security review will ask for and will not find:
 
-- Single sign-on (SAML or OIDC) and multi-factor sign-in.
+- SAML single sign-on (OpenID Connect is supported), and hardware security keys (WebAuthn).
 - Encryption at rest. Use encrypted disks or a managed database; backups are not encrypted by the script.
 - Tamper-evident audit log. A database administrator can still change `audit_log`.
 - Field-level masking or tokenisation of account identifiers.

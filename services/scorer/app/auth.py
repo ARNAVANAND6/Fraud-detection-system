@@ -13,9 +13,9 @@ Passwords are stored as scrypt hashes. Session tokens are random, stored
 only as SHA-256 digests, and expire. Every sign-in attempt and every change
 made through the API is written to the audit log with who did it.
 
-Not covered here, and needed before real use: single sign-on (OIDC/SAML),
-multi-factor sign-in, and TLS in front of the API (tokens and passwords
-travel in headers and bodies, so plain HTTP is only acceptable on localhost).
+Two-factor sign-in (authenticator app codes) is in mfa.py and single
+sign-on (OpenID Connect) in sso.py. Both end in the same kind of session.
+TLS comes from the proxy in front of the API (infra/proxy).
 """
 from __future__ import annotations
 
@@ -35,6 +35,8 @@ ROLES = ("VIEWER", "ANALYST", "ADMIN")
 SERVICE = "SERVICE"  # an API key, not a person
 MIN_PASSWORD_LENGTH = 10
 SESSION_HOURS = 8
+CHALLENGE_MINUTES = 5
+CHALLENGE_ATTEMPTS = 5
 _SCRYPT = {"n": 2**14, "r": 8, "p": 1}
 
 AUTH_SCHEMA = """
@@ -65,6 +67,32 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ip      TEXT
 );
 CREATE INDEX IF NOT EXISTS audit_log_at_idx ON audit_log (at DESC);
+-- Two-factor sign-in and single sign-on (added later; ALTER keeps older databases working).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS sso_subject TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_secret TEXT;          -- encrypted, see mfa.SecretBox
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_pending TEXT;         -- encrypted, set up but not confirmed
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_last_step BIGINT;     -- no code is accepted twice
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_recovery TEXT[] NOT NULL DEFAULT '{}';  -- SHA-256 digests
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_idx ON users (lower(email)) WHERE email IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS users_sso_subject_idx ON users (sso_subject) WHERE sso_subject IS NOT NULL;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS limited BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS method TEXT NOT NULL DEFAULT 'password';
+-- Password accepted, second factor still owed. Short-lived, single use, attempt-limited.
+CREATE TABLE IF NOT EXISTS login_challenges (
+    token_sha256  TEXT PRIMARY KEY,
+    username      TEXT NOT NULL REFERENCES users (username) ON DELETE CASCADE,
+    expires_at    TIMESTAMPTZ NOT NULL,
+    attempts      INT NOT NULL DEFAULT 0
+);
+-- Single sign-on round trips in flight: state, nonce and PKCE verifier, single use.
+CREATE TABLE IF NOT EXISTS sso_states (
+    state_sha256   TEXT PRIMARY KEY,
+    nonce          TEXT NOT NULL,
+    code_verifier  TEXT NOT NULL,
+    expires_at     TIMESTAMPTZ NOT NULL
+);
 """
 
 
@@ -129,6 +157,9 @@ class LoginThrottle:
 class Principal:
     name: str
     role: str  # one of ROLES, or SERVICE for an API key
+    # Signed in with a password, in a role that must use two-factor sign-in, not enrolled yet:
+    # may only enrol, look at who they are and sign out.
+    limited: bool = False
 
     @property
     def is_person(self) -> bool:
@@ -146,6 +177,17 @@ def audit(request: Request, who: Principal | None, action: str, target: str | No
         action=action, target=target, detail=detail or {}, ip=client_ip(request))
 
 
+def start_session(request: Request, user: dict, method: str, limited: bool = False) -> dict:
+    token = secrets.token_urlsafe(32)
+    expires = datetime.now(UTC) + timedelta(hours=SESSION_HOURS)
+    request.app.state.repo.create_session(token_digest(token), user["username"], expires, limited, method)
+    audit(request, Principal(user["username"], user["role"]), "LOGIN", detail={"method": method, "limited": limited})
+    out = {"token": token, "username": user["username"], "role": user["role"], "expires_at": expires.isoformat()}
+    if limited:
+        out["mfa_enrolment_required"] = True
+    return out
+
+
 def login(request: Request, username: str, password: str) -> dict:
     st = request.app.state
     username = username.strip().lower()
@@ -160,11 +202,38 @@ def login(request: Request, username: str, password: str) -> dict:
         audit(request, None, "LOGIN_FAILED", target=username, actor=username)
         raise HTTPException(status_code=401, detail="wrong username or password")
     st.login_throttle.clear(key)
-    token = secrets.token_urlsafe(32)
-    expires = datetime.now(UTC) + timedelta(hours=SESSION_HOURS)
-    st.repo.create_session(token_digest(token), username, expires)
-    audit(request, Principal(username, user["role"]), "LOGIN")
-    return {"token": token, "username": username, "role": user["role"], "expires_at": expires.isoformat()}
+    if user.get("mfa_enabled"):
+        challenge = secrets.token_urlsafe(32)
+        st.repo.create_challenge(token_digest(challenge), username,
+                                 datetime.now(UTC) + timedelta(minutes=CHALLENGE_MINUTES))
+        audit(request, None, "LOGIN_PASSWORD_OK", target=username, actor=username)
+        return {"mfa_required": True, "mfa_token": challenge, "expires_in": CHALLENGE_MINUTES * 60}
+    limited = user["role"] in st.settings.mfa_required_roles
+    return start_session(request, user, "password", limited=limited)
+
+
+def login_second_factor(request: Request, mfa_token: str, code: str) -> dict:
+    """Finish a sign-in with an authenticator code or a recovery code."""
+    from . import mfa
+
+    st = request.app.state
+    challenge = st.repo.use_challenge(token_digest(mfa_token), CHALLENGE_ATTEMPTS)
+    if challenge is None:
+        raise HTTPException(status_code=401, detail="sign-in expired or too many wrong codes; start again")
+    user = st.repo.get_user(challenge["username"])
+    if not (user and user["active"] and user.get("mfa_enabled")):
+        raise HTTPException(status_code=401, detail="sign-in expired; start again")
+    secret = mfa.SecretBox(st.settings.secret_key).open(user["mfa_secret"] or "")
+    step = mfa.match_step(secret, code, user.get("mfa_last_step")) if secret else None
+    if step is not None and st.repo.set_mfa_last_step(user["username"], step):
+        method = "password+totp"
+    elif "-" in code and st.repo.use_recovery_code(user["username"], mfa.recovery_digest(code)):
+        method = "password+recovery_code"
+    else:
+        audit(request, None, "MFA_FAILED", target=user["username"], actor=user["username"])
+        raise HTTPException(status_code=401, detail="wrong code")
+    st.repo.delete_challenge(token_digest(mfa_token))
+    return start_session(request, user, method)
 
 
 def current_principal(request: Request, authorization: str | None = Header(default=None),
@@ -175,7 +244,7 @@ def current_principal(request: Request, authorization: str | None = Header(defau
         user = st.repo.get_session_user(token_digest(authorization[7:].strip()))
         if user is None:
             raise HTTPException(status_code=401, detail="session expired or invalid; sign in again")
-        who = Principal(user["username"], user["role"])
+        who = Principal(user["username"], user["role"], bool(user.get("limited")))
     elif x_api_key is not None and x_api_key in st.settings.api_keys:
         who = Principal(f"apikey:{hashlib.sha256(x_api_key.encode()).hexdigest()[:8]}", SERVICE)
     else:
@@ -185,12 +254,15 @@ def current_principal(request: Request, authorization: str | None = Header(defau
     return who
 
 
-def require(*allowed: str):
+def require(*allowed: str, allow_limited: bool = False):
     """Dependency factory: the caller's role must be one of `allowed`."""
 
     def dependency(request: Request, authorization: str | None = Header(default=None),
                    x_api_key: str | None = Header(default=None)) -> Principal:
         who = current_principal(request, authorization, x_api_key)
+        if who.limited and not allow_limited:
+            raise HTTPException(status_code=403, detail="two-factor sign-in is required for your role: "
+                                                        "set it up before using VYROX")
         if who.role not in allowed:
             audit(request, who, "DENIED", target=f"{request.method} {request.url.path}")
             needed = " or ".join(a for a in allowed if a != SERVICE) or "an API key"
@@ -205,3 +277,4 @@ can_ingest = require("ADMIN", SERVICE)
 can_work_alerts = require("ANALYST", "ADMIN")
 admin_only = require("ADMIN")
 signed_in = require(*ROLES)
+signed_in_or_enrolling = require(*ROLES, allow_limited=True)
