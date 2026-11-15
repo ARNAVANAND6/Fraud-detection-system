@@ -147,9 +147,11 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--alert-rate", type=float, default=0.01, help="share of traffic analysts can review")
     ap.add_argument("--version", default=datetime.now(UTC).strftime("v%Y%m%d%H%M"))
-    ap.add_argument("--device", choices=["cpu", "gpu", "cuda"], default=os.environ.get("TRAIN_DEVICE", "cpu"),
-                    help="where LightGBM trains: gpu needs an OpenCL-enabled LightGBM, cuda a CUDA build. "
-                         "Only LightGBM uses it; the other models and the feature build stay on the CPU.")
+    ap.add_argument("--device", choices=["cpu", "cuda"], default=os.environ.get("TRAIN_DEVICE", "cpu"),
+                    help="where XGBoost trains (cuda = NVIDIA GPU; XGBoost's pip package includes CUDA). "
+                         "Features, rules, logistic regression and random forest always use the CPU.")
+    ap.add_argument("--lightgbm-device", choices=["cpu", "gpu", "cuda"], default="cpu",
+                    help="gpu/cuda need a LightGBM built from source with GPU support; the pip build is CPU only")
     a = ap.parse_args()
 
     cols, times, y = load_columns(a.data, a.paysim, a.limit)
@@ -175,10 +177,22 @@ def main() -> None:
                                        # thousands (PaySim: ~1,800) lets leaf values run away and the
                                        # scores saturate at 1.0.
                                        max_delta_step=1.0,
-                                       device_type=a.device,
+                                       device_type=a.lightgbm_device,
                                        random_state=0, verbose=-1),
     }
-    # XGBoost slots in the same way (xgboost.XGBClassifier) once installed.
+    try:
+        import xgboost as xgb
+    except ImportError:
+        xgb = None
+        print("xgboost not installed: skipping it (pip install xgboost)")
+    if xgb is not None:
+        # Same settings as LightGBM where they mean the same thing, so the two compare fairly.
+        models["xgboost"] = xgb.XGBClassifier(
+            n_estimators=400, learning_rate=0.05, max_depth=8, min_child_weight=5, subsample=0.8,
+            colsample_bytree=0.8, scale_pos_weight=pos_weight, max_delta_step=1.0,
+            tree_method="hist", device=a.device, eval_metric="aucpr", random_state=0)
+    elif a.device == "cuda":
+        sys.exit("--device cuda trains XGBoost on the GPU, but xgboost is not installed")
     results, fitted, fit_seconds = {}, {}, {}
     for name, model in models.items():
         if model is None:
@@ -207,7 +221,8 @@ def main() -> None:
         "threshold_review": results["lightgbm"]["validation"]["threshold"],
         "alert_rate": a.alert_rate, "trained_at": datetime.now(UTC).isoformat(),
         "data": str(a.data), "rows": len(y),
-        "lightgbm_device": a.device, "fit_seconds": fit_seconds,
+        "devices": {"xgboost": a.device if "xgboost" in fitted else None, "lightgbm": a.lightgbm_device},
+        "fit_seconds": fit_seconds,
     }
     (out_dir / "model_meta.json").write_text(json.dumps(meta, indent=2))
     # What the model's inputs looked like in training, for drift monitoring at run time.

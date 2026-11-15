@@ -323,7 +323,7 @@ the training data.
 - No synchronous approve-or-decline call: scoring is asynchronous, for review after submission.
 - Login lock-out and rate limits are held in the API process, so they reset on restart and are per replica.
 - "Spark backlog" on the dashboard is an approximation from topic offsets.
-- PaySim was trained on its first 500,000 rows only (see docs/MODEL_CARD.md); the full 6.3 million-row run is pending.
+- PaySim results (all 6.3 million rows) are in docs/MODEL_CARD.md. They show the pipeline scales, not real accuracy.
 - Not done from the original plan: IEEE-CIS training, Airflow, dbt, MLflow registry, AWS deployment.
 
 ## Tests
