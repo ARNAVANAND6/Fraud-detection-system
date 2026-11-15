@@ -157,9 +157,10 @@ main.stale .kpi-value, main.stale .series svg, main.stale .dist, main.stale tabl
 footer { font-size: 11.5px; color: var(--muted); padding: 4px 4px 8px; }
 
 /* ---- panels ---- */
-.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
-.kpi { border-radius: var(--r-md); padding: 12px 14px; }
-.kpi-value { font-size: 22px; font-weight: 600; letter-spacing: -.01em; margin-top: 2px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.kpi { border-radius: var(--r-md); padding: 12px 14px; min-width: 0; }
+/* A figure never breaks across lines; it shrinks a little on narrow screens instead. */
+.kpi-value { font-size: clamp(17px, 1vw + 9px, 22px); font-weight: 600; letter-spacing: -.01em; margin-top: 2px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .kpi-sub { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
 .panel { border-radius: var(--r-lg); padding: 14px 16px; min-width: 0; }
 .panel.narrow { max-width: 720px; }
