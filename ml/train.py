@@ -16,7 +16,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -35,37 +35,81 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "libs"))
-from fraudlib.features import FEATURE_NAMES, OfflineFeatureBuilder
+from fraudlib.features import FEATURE_NAMES, build_feature_matrix
 from fraudlib.rules import evaluate_rules
-from fraudlib.schemas import TransactionEvent
+from fraudlib.schemas import TxnType
+
+PAYSIM_START = datetime(2026, 1, 1, tzinfo=UTC)
+CHUNK_ROWS = 500_000
 
 
-def load_events(path: Path, paysim: bool, limit: int | None) -> tuple[list[TransactionEvent], np.ndarray]:
-    df = pd.read_csv(path, nrows=limit)
+def _hash_ids(col: pd.Series) -> np.ndarray:
+    return pd.util.hash_array(col.to_numpy(dtype=object), categorize=False)
+
+
+def load_columns(path: Path, paysim: bool, limit: int | None) -> tuple[dict, np.ndarray, np.ndarray]:
+    """Read the CSV in chunks into one numeric array per column.
+
+    Account, counterparty and device ids are kept as 64-bit hashes of the
+    strings, which is all the features need, so 6.3 million PaySim rows fit in
+    a few hundred MB instead of several GB of Python objects.
+    Returns (columns for build_feature_matrix, event time in ms, labels).
+    """
+    types = list(TxnType)
+    type_code = {t.value: i for i, t in enumerate(types)}
+    parts: dict[str, list[np.ndarray]] = {k: [] for k in (
+        "t", "account", "counterparty", "device", "has_device", "txn_type", "amount",
+        "old_balance_orig", "old_balance_dest", "y")}
+    for df in pd.read_csv(path, nrows=limit, chunksize=CHUNK_ROWS):
+        if paysim:
+            # PaySim: step = hour index. newbalance* columns are post-transaction
+            # values (not known at scoring time) and are deliberately not read.
+            df = df.rename(columns={"nameOrig": "account_id", "nameDest": "counterparty_id", "type": "txn_type",
+                                    "oldbalanceOrg": "old_balance_orig", "oldbalanceDest": "old_balance_dest",
+                                    "isFraud": "is_fraud"})
+            df["amount"] = df["amount"].clip(lower=0.01)
+            parts["t"].append(df["step"].to_numpy(dtype=np.int64))
+        else:
+            # Same arithmetic as TransactionEvent.event_ms, so both paths agree to the millisecond.
+            us = (pd.to_datetime(df["event_time"], utc=True, format="ISO8601")
+                  - pd.Timestamp(0, tz="UTC")) // pd.Timedelta(microseconds=1)
+            parts["t"].append(np.floor(us.to_numpy(dtype=np.float64) / 1e6 * 1000).astype(np.int64))
+        unknown = set(df["txn_type"].unique()) - set(type_code)
+        if unknown:
+            raise ValueError(f"unknown txn_type values: {sorted(unknown)}")
+        for name in ("amount", "old_balance_orig", "old_balance_dest"):
+            col = df[name].to_numpy(dtype=np.float64)
+            bad = ~np.isfinite(col) | (col < 0)
+            if name == "amount":
+                bad |= (col <= 0) | (col >= 1e9)
+            if bad.any():
+                raise ValueError(f"{name} has values outside what TransactionEvent accepts")
+            parts[name].append(col)
+        has_device = df["device_id"].notna().to_numpy() if "device_id" in df else np.zeros(len(df), dtype=bool)
+        parts["has_device"].append(has_device)
+        parts["device"].append(_hash_ids(df["device_id"].fillna("")) if "device_id" in df
+                               else np.zeros(len(df), dtype=np.uint64))
+        parts["account"].append(_hash_ids(df["account_id"]))
+        parts["counterparty"].append(_hash_ids(df["counterparty_id"]))
+        parts["txn_type"].append(df["txn_type"].map(type_code).to_numpy(dtype=np.int8))
+        parts["y"].append(df["is_fraud"].to_numpy(dtype=np.int64))
+    cols = {k: np.concatenate(v) for k, v in parts.items()}
+    t = cols.pop("t")
     if paysim:
-        # PaySim: step = hour index. newbalance* columns are post-transaction
-        # values (not known at scoring time) and are deliberately dropped.
-        start = datetime(2026, 1, 1, tzinfo=UTC)
-        rng = np.random.default_rng(0)
-        secs = rng.integers(0, 3600, len(df))
-        df = pd.DataFrame({
-            "transaction_id": [f"PS_{i}" for i in range(len(df))],
-            "event_time": [start + timedelta(hours=int(s), seconds=int(x))
-                           for s, x in zip(df["step"], secs, strict=True)],
-            "account_id": df["nameOrig"], "counterparty_id": df["nameDest"], "txn_type": df["type"],
-            "amount": df["amount"].clip(lower=0.01), "old_balance_orig": df["oldbalanceOrg"],
-            "old_balance_dest": df["oldbalanceDest"], "is_fraud": df["isFraud"],
-        })
-    else:
-        df["event_time"] = pd.to_datetime(df["event_time"], utc=True, format="ISO8601")
-    cols = [c for c in TransactionEvent.model_fields if c in df.columns]
-    events = []
-    for rec in df[cols].to_dict("records"):
-        rec = {k: v for k, v in rec.items() if not (isinstance(v, float) and np.isnan(v))}
-        rec["event_time"] = rec["event_time"].to_pydatetime() if hasattr(rec["event_time"], "to_pydatetime") \
-            else rec["event_time"]
-        events.append(TransactionEvent(**rec))
-    return events, df["is_fraud"].to_numpy().astype(int)
+        # One draw for the whole file, as before, so a given --limit always gets the same times.
+        secs = np.random.default_rng(0).integers(0, 3600, len(t))
+        t = int(PAYSIM_START.timestamp() * 1000) + t * 3_600_000 + secs * 1000
+    y = cols.pop("y")
+    return cols, t, y
+
+
+def rules_scores(X: np.ndarray, block: int = 100_000) -> np.ndarray:
+    """Rule score per row, built a block at a time so the row dicts never all exist at once."""
+    out = np.empty(len(X))
+    for start in range(0, len(X), block):
+        rows = X[start:start + block].tolist()
+        out[start:start + block] = [evaluate_rules(dict(zip(FEATURE_NAMES, r, strict=True)))[0] for r in rows]
+    return out
 
 
 def time_split(times: np.ndarray, train: float = 0.7, val: float = 0.15):
@@ -103,9 +147,9 @@ def main() -> None:
     ap.add_argument("--version", default=datetime.now(UTC).strftime("v%Y%m%d%H%M"))
     a = ap.parse_args()
 
-    events, y = load_events(a.data, a.paysim, a.limit)
-    X = pd.DataFrame(OfflineFeatureBuilder().build(events))[FEATURE_NAMES]
-    times = np.array([e.event_ms for e in events])
+    cols, times, y = load_columns(a.data, a.paysim, a.limit)
+    X = pd.DataFrame(build_feature_matrix(event_ms=times, **cols), columns=FEATURE_NAMES)
+    del cols
     tr, va, te = time_split(times)
     print(f"rows={len(y)} fraud_rate={y.mean():.4%} train={tr.sum()} val={va.sum()} test={te.sum()}")
     print(f"fraud in train/val/test: {y[tr].sum()}/{y[va].sum()}/{y[te].sum()}")
@@ -122,13 +166,17 @@ def main() -> None:
         "lightgbm": lgb.LGBMClassifier(n_estimators=400, learning_rate=0.05, num_leaves=31,
                                        min_child_samples=50, subsample=0.8, subsample_freq=1,
                                        colsample_bytree=0.8, scale_pos_weight=pos_weight,
+                                       # Caps each leaf's output. Without it, a class weight in the
+                                       # thousands (PaySim: ~1,800) lets leaf values run away and the
+                                       # scores saturate at 1.0.
+                                       max_delta_step=1.0,
                                        random_state=0, verbose=-1),
     }
     # XGBoost slots in the same way (xgboost.XGBClassifier) once installed.
     results, fitted = {}, {}
     for name, model in models.items():
         if model is None:
-            score_fn = lambda df: np.array([evaluate_rules(r)[0] for r in df.to_dict("records")])
+            score_fn = lambda df: rules_scores(df.to_numpy())
         else:
             model.fit(X[tr], y[tr])
             fitted[name] = model
@@ -155,7 +203,9 @@ def main() -> None:
     (out_dir / "model_meta.json").write_text(json.dumps(meta, indent=2))
     Path("reports").mkdir(exist_ok=True)
     report = {"meta": meta, "results": results, "lightgbm_gain_importance": importance,
-              "caveat": "Synthetic data from this project's own simulator; not real-world performance."}
+              "caveat": ("PaySim: a public simulator of mobile-money transfers, not real UPI or bank data; "
+                         "not real-world performance." if a.paysim else
+                         "Synthetic data from this project's own simulator; not real-world performance.")}
     (Path("reports") / f"train_{a.version}.json").write_text(json.dumps(report, indent=2))
     print(f"saved {out_dir} and reports/train_{a.version}.json")
 
