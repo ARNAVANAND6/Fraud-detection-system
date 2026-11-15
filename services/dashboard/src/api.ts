@@ -89,15 +89,18 @@ export interface Status {
   spark_backlog: number | null; last_event_at: string | null; last_inference_at: string | null;
   seconds_since_last_event: number | null; active_sources: Source[]; dashboard_clients: number;
   /** Present when the server runs as more than one process; absent on older servers. */
-  nodes?: { id: string; kind: "api" | "scorer"; alive: boolean; last_seen: string | null }[];
+  node?: string;
+  nodes?: { id: string; kind: "api" | "scorer"; alive: boolean; last_seen: string | null; partitions?: number | null }[];
 }
 export interface User {
   username: string; role: Role; active: boolean; created_at?: string; updated_at?: string;
   mfa_enabled?: boolean; sso?: boolean;
 }
 export interface Connector {
-  name: string; kind: string; enabled: boolean; last_event_at: string | null; events_24h: number; last_error: string | null;
+  name: string; kind: string; path: string; enabled: boolean; balance_known: boolean; last_event_at: string | null;
+  events_24h: number; last_error: string | null; last_error_at: string | null;
 }
+export interface Connectors { connectors: Connector[]; alert_webhook_configured: boolean }
 export interface ScoreResult {
   transaction_id: string; risk_score: number; risk_level: RiskLevel; decision: "ALLOW" | "REVIEW" | "HOLD";
   reason_codes: string[]; model_version: string; scored_at: string; latency_ms: number | null; disclaimer?: string;
@@ -145,7 +148,7 @@ export const api = {
   mfaDisable: (password: string, code: string) =>
     call<void>("/v1/auth/mfa/disable", { method: "POST", body: JSON.stringify({ password, code }) }),
   status: () => call<Status>("/v1/status"),
-  connectors: () => call<Connector[]>("/v1/connectors"),
+  connectors: () => call<Connectors>("/v1/connectors"),
   /** Dry run: the server scores the event with current features and stores nothing. */
   score: (event: Record<string, unknown>) => call<ScoreResult>("/v1/score", { method: "POST", body: JSON.stringify(event) }),
   logout: async () => { try { await call<void>("/v1/auth/logout", { method: "POST" }); } finally { session.set(null); } },

@@ -12,7 +12,7 @@ type Tab = "overview" | "alerts" | "check" | "performance" | "integrations" | "i
 // What each role sees. The server enforces the same rules; this only hides what would be refused.
 const TABS: Record<Role, Tab[]> = {
   VIEWER: ["overview", "alerts", "performance", "integrations", "security"],
-  ANALYST: ["overview", "alerts", "performance", "integrations", "security"],
+  ANALYST: ["overview", "alerts", "check", "performance", "integrations", "security"],
   ADMIN: ["overview", "alerts", "check", "performance", "integrations", "ingest", "settings", "admin", "security"],
 };
 const NAV: { group: string; tabs: Tab[] }[] = [
@@ -601,14 +601,16 @@ function ScoreRing({ score, level }: { score: number; level: RiskLevel }) {
 }
 
 function CheckTransaction() {
-  const blank = { account_id: "", counterparty_id: "", txn_type: "TRANSFER", amount: "", old_balance_orig: "", old_balance_dest: "0",
+  const blank = { account_id: "", counterparty_id: "", txn_type: "TRANSFER", amount: "", old_balance_orig: "", old_balance_dest: "",
                   channel: "APP", device_id: "" };
   const [f, setF] = useState(blank);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ sent: typeof blank; r: ScoreResult } | null>(null);
   const [error, setError] = useState("");
   const set = (k: keyof typeof blank) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => setF({ ...f, [k]: e.target.value });
-  const ready = f.account_id && f.counterparty_id && Number(f.amount) > 0 && f.old_balance_orig !== "";
+  const ready = f.account_id && f.counterparty_id && Number(f.amount) > 0;
+  // A blank balance means "not known" and is left out, as payment-gateway events are; it is not read as zero.
+  const balance = (v: string) => (v.trim() === "" ? {} : { value: Number(v) });
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true); setError("");
@@ -616,13 +618,15 @@ function CheckTransaction() {
       const r = await api.score({
         transaction_id: `CHECK_${Date.now().toString(36)}`, event_time: new Date().toISOString(),
         account_id: f.account_id.trim(), counterparty_id: f.counterparty_id.trim(), txn_type: f.txn_type,
-        amount: Number(f.amount), old_balance_orig: Number(f.old_balance_orig), old_balance_dest: Number(f.old_balance_dest || 0),
+        amount: Number(f.amount),
+        ...("value" in balance(f.old_balance_orig) ? { old_balance_orig: Number(f.old_balance_orig) } : {}),
+        ...("value" in balance(f.old_balance_dest) ? { old_balance_dest: Number(f.old_balance_dest) } : {}),
         channel: f.channel || "APP", ...(f.device_id.trim() ? { device_id: f.device_id.trim() } : {}),
       });
       setResult({ sent: f, r });
     } catch (err) {
       const m = (err as Error).message;
-      setError(m.startsWith("403") ? "Only administrators and API clients can run checks." : m.startsWith("422") ? `The server rejected a field: ${m.slice(5)}` : m);
+      setError(m.startsWith("403") ? "Only analysts, administrators and API clients can run checks." : m.startsWith("422") ? `The server rejected a field: ${m.slice(5)}` : m);
     } finally { setBusy(false); }
   };
   const r = result?.r;
@@ -635,8 +639,8 @@ function CheckTransaction() {
           <label>Counterparty<input value={f.counterparty_id} onChange={set("counterparty_id")} placeholder="M000000001" /></label>
           <label>Type<select value={f.txn_type} onChange={set("txn_type")}>{TXN_TYPES.map((t) => <option key={t}>{t}</option>)}</select></label>
           <label>Amount (₹)<input inputMode="decimal" value={f.amount} onChange={set("amount")} /></label>
-          <label>Sender balance before (₹)<input inputMode="decimal" value={f.old_balance_orig} onChange={set("old_balance_orig")} /></label>
-          <label>Receiver balance before (₹)<input inputMode="decimal" value={f.old_balance_dest} onChange={set("old_balance_dest")} /></label>
+          <label><span>Sender balance before (₹) <span className="muted">(blank if unknown)</span></span><input inputMode="decimal" value={f.old_balance_orig} onChange={set("old_balance_orig")} /></label>
+          <label><span>Receiver balance before (₹) <span className="muted">(blank if unknown)</span></span><input inputMode="decimal" value={f.old_balance_dest} onChange={set("old_balance_dest")} /></label>
           <label>Channel<input value={f.channel} onChange={set("channel")} /></label>
           <label><span>Device id <span className="muted">(optional)</span></span><input value={f.device_id} onChange={set("device_id")} /></label>
         </div>
@@ -725,19 +729,21 @@ function Nodes({ status, now }: { status: Status | null; now: number }) {
   const nodes = status?.nodes;
   return (
     <div className="panel" data-testid="nodes">
-      <div className="panel-head"><h3>Servers</h3><span className="muted small">API and scorer processes that reported in</span></div>
+      <div className="panel-head"><h3>Servers</h3><span className="muted small">
+        API and scorer processes seen in the last hour{status?.node ? `; this page is served by ${status.node}` : ""}</span></div>
       {!nodes ? (
         <div className="empty">This server does not report its processes. It is running as a single node.</div>
       ) : (
         <table className="compact">
-          <thead><tr><th>Process</th><th>Kind</th><th>State</th><th>Last heartbeat</th></tr></thead>
+          <thead><tr><th>Process</th><th>Kind</th><th>State</th><th className="r">Partitions</th><th>Last heartbeat</th></tr></thead>
           <tbody>
             {nodes.map((n) => (
-              <tr key={n.id}><td className="mono">{n.id}</td><td>{n.kind}</td>
+              <tr key={`${n.kind}:${n.id}`}><td className="mono">{n.id}</td><td>{n.kind}</td>
                 <td><span className={`state ${n.alive ? "ok" : "bad"}`}>{n.alive ? "running" : "not responding"}</span></td>
+                <td className="r">{n.kind === "scorer" && n.alive ? n.partitions ?? "" : ""}</td>
                 <td>{ago(n.last_seen, now)}</td></tr>
             ))}
-            {!nodes.length && <tr><td colSpan={4} className="muted">No processes reported.</td></tr>}
+            {!nodes.length && <tr><td colSpan={5} className="muted">No processes reported.</td></tr>}
           </tbody>
         </table>
       )}
@@ -796,14 +802,17 @@ function ModelHealth() {
 
 // ---- integrations ---------------------------------------------------------------------
 
+const CONNECTOR_NAME: Record<string, string> = { razorpay: "Razorpay", stripe: "Stripe", generic: "Signed webhook" };
+
 function Integrations({ now }: { now: number }) {
   const [rows, setRows] = useState<Connector[] | null>(null);
+  const [alerting, setAlerting] = useState<boolean | null>(null);
   const [state, setState] = useState<"loading" | "ok" | "missing" | "error">("loading");
   const [err, setErr] = useState("");
   useEffect(() => {
     let stop = false;
     const load = () => api.connectors()
-      .then((r) => { if (!stop) { setRows(r); setState("ok"); } })
+      .then((r) => { if (!stop) { setRows(r.connectors); setAlerting(r.alert_webhook_configured); setState("ok"); } })
       .catch((e) => { if (!stop) { setState(notFound(e) ? "missing" : "error"); setErr((e as Error).message); } });
     load();
     const t = setInterval(load, 15_000);
@@ -818,28 +827,44 @@ function Integrations({ now }: { now: number }) {
         {state === "error" && <div className="error">{err}</div>}
         {state === "ok" && rows && (
           <table data-testid="connectors">
-            <thead><tr><th>Name</th><th>Kind</th><th>State</th><th>Last event</th><th className="r">Events, 24 h</th><th>Last error</th></tr></thead>
+            <thead><tr><th>Name</th><th>Webhook path</th><th>State</th><th>Last event</th><th className="r">Events, 24 h</th><th>Last error</th></tr></thead>
             <tbody>
-              {rows.map((c) => (
-                <tr key={c.name}>
-                  <td>{c.name}</td><td className="mono small">{c.kind}</td>
-                  <td><span className={`state ${!c.enabled ? "off" : c.last_error ? "bad" : "ok"}`}>
-                    {!c.enabled ? "disabled" : c.last_error ? "failing" : "enabled"}</span></td>
-                  <td>{ago(c.last_event_at, now)}</td><td className="r">{num(c.events_24h)}</td>
-                  <td className="small">{c.last_error ?? <span className="muted">none</span>}</td>
-                </tr>
-              ))}
+              {rows.map((c) => {
+                // Failing only while the newest thing that happened is an error.
+                const failing = !!c.last_error_at && (!c.last_event_at || c.last_error_at > c.last_event_at);
+                return (
+                  <tr key={c.name}>
+                    <td>{CONNECTOR_NAME[c.name] ?? c.name}{!c.balance_known && <div className="muted small">no balances: scored mainly by rules</div>}</td>
+                    <td className="mono small">{c.path}</td>
+                    <td><span className={`state ${!c.enabled ? "off" : failing ? "bad" : "ok"}`}>
+                      {!c.enabled ? "off" : failing ? "failing" : "on"}</span></td>
+                    <td>{ago(c.last_event_at, now)}</td><td className="r">{num(c.events_24h)}</td>
+                    <td className="small">{c.last_error ? <>{c.last_error} <span className="muted">({ago(c.last_error_at, now)})</span></>
+                      : <span className="muted">none</span>}</td>
+                  </tr>
+                );
+              })}
               {!rows.length && <tr><td colSpan={6} className="muted">No connectors configured.</td></tr>}
             </tbody>
           </table>
         )}
       </div>
+      {alerting !== null && (
+        <div className="panel">
+          <div className="panel-head"><h3>Operational alerts</h3></div>
+          <p className="note">
+            {alerting
+              ? "Posting to the configured chat webhook: new priority-1 alerts (at most 10 an hour), stopped servers, a disconnected stream and failed backups."
+              : "Off. Set ALERT_WEBHOOK_URL to a Slack, Teams or other incoming webhook to be told about stopped servers, failed backups and priority-1 alerts."}
+          </p>
+        </div>
+      )}
       <div className="panel">
         <div className="panel-head"><h3>Ways data can arrive</h3></div>
         <table className="compact">
           <tbody>
             <tr><td><SourceBadge source="LIVE_API" /></td><td>POST /v1/transactions with an API key</td></tr>
-            <tr><td><SourceBadge source="LIVE_WEBHOOK" /></td><td>POST /v1/webhooks/generic, HMAC-SHA256 signed, replay-protected</td></tr>
+            <tr><td><SourceBadge source="LIVE_WEBHOOK" /></td><td>POST /v1/webhooks/generic, HMAC-SHA256 signed, replay-protected; or a Razorpay or Stripe webhook, checked with the provider's signature</td></tr>
             <tr><td><SourceBadge source="KAFKA_STREAM" /></td><td>events another system produces directly to the transactions topic</td></tr>
             <tr><td><SourceBadge source="HISTORICAL_IMPORT" /></td><td>CSV or Parquet upload</td></tr>
             <tr><td><SourceBadge source="SIMULATED_DEMO" /></td><td>built-in generator and fraud scenarios, demo environment only</td></tr>
