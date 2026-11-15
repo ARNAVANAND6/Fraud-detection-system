@@ -119,3 +119,25 @@ def test_model_reasons_are_true_statements():
     r = s.score(e, f, Thresholds(medium=0.01, high=0.02, critical=0.03))
     assert "HIGH_VELOCITY_1H" not in r.reason_codes and "RAPID_TRANSACTION_PATTERN" not in r.reason_codes
     assert "NEW_DEVICE" not in r.reason_codes  # the event carries no device
+
+
+def test_scorer_survives_losing_its_group_assignment():
+    """A machine that sleeps gets dropped from the consumer group; the commit that follows must not kill the scorer."""
+    import pytest
+    from confluent_kafka import KafkaError, KafkaException
+
+    from services.scorer.app.consumer import ScoringWorker
+
+    class FakeConsumer:
+        def __init__(self, code):
+            self.code = code
+
+        def commit(self, asynchronous=False):
+            raise KafkaException(KafkaError(self.code))
+
+    worker = ScoringWorker.__new__(ScoringWorker)
+    worker.consumer = FakeConsumer(KafkaError._ASSIGNMENT_LOST)
+    worker.commit()  # logged and skipped; the events are replayed after the rejoin
+    worker.consumer = FakeConsumer(KafkaError._ALL_BROKERS_DOWN)
+    with pytest.raises(KafkaException):
+        worker.commit()  # anything else is still a real failure
