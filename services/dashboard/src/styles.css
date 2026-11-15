@@ -140,3 +140,10 @@ td.small { word-break: break-all; }
   :root { --glass: var(--surface); --glass-strong: var(--surface); --blur: none; }
   body::before { background: var(--page); }
 }
+
+/* Model health (drift) */
+.drift { font-weight: 600; }
+.drift.STABLE { color: var(--good); }
+.drift.WATCH { color: var(--warning); }
+.drift.DRIFTED { color: var(--critical); }
+.drift.NEEDS_24H, .drift.NOT_ENOUGH_DATA, .drift.NO_REFERENCE { color: var(--muted); }

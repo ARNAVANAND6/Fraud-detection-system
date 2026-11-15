@@ -391,3 +391,23 @@ def test_user_management(client):
     audit = client.get("/v1/audit", headers=admin).json()
     assert {"USER_CREATE", "USER_CHANGE"} <= {a["action"] for a in audit}
     assert "long-enough-pass" not in json.dumps(audit)
+
+
+def test_drift_endpoint_reports_missing_reference_then_real_comparison(client):
+    from fraudlib import drift
+    from fraudlib.features import FEATURE_NAMES
+
+    assert client.get("/v1/model/drift").status_code == 401
+    app.state.drift_cache = None
+    assert client.get("/v1/model/drift", headers=KEY).json()["status"] == "NO_REFERENCE"
+
+    import numpy as np
+    rng = np.random.default_rng(1)
+    train = rng.random((5000, len(FEATURE_NAMES)))
+    app.state.scorer.reference = drift.build_reference(train, FEATURE_NAMES)
+    live = [dict(zip(FEATURE_NAMES, r, strict=True)) for r in (rng.random((1000, len(FEATURE_NAMES))) * 3).tolist()]
+    app.state.repo.recent_features = lambda: (live, 24.0)
+    app.state.drift_cache = None
+    body = client.get("/v1/model/drift", headers=KEY).json()
+    assert body["status"] == "DRIFTED" and body["rows"] == 1000 and len(body["features"]) == len(FEATURE_NAMES)
+    app.state.drift_cache = None

@@ -125,3 +125,34 @@ def test_feature_matrix_matches_offline_builder():
     want = np.array([[f[n] for n in FEATURE_NAMES] for f in OfflineFeatureBuilder().build(events)], dtype=np.float32)
     assert got.shape == want.shape
     assert np.array_equal(got, want)
+
+
+def test_drift_is_low_for_same_distribution_and_high_for_shifted():
+    import numpy as np
+    from fraudlib import drift
+
+    rng = np.random.default_rng(0)
+    names = ["amount", "is_transfer", "hour_of_day"]
+
+    def sample(n, scale, p):
+        return np.column_stack([rng.lognormal(6, 1, n) * scale, rng.random(n) < p, rng.integers(0, 24, n)])
+
+    ref = drift.build_reference(sample(50_000, 1.0, 0.2), names)
+    assert abs(sum(ref["features"]["amount"]["shares"]) - 1) < 1e-4
+
+    def rows(m):
+        return [dict(zip(names, r, strict=True)) for r in m.tolist()]
+
+    same = drift.compare(ref, rows(sample(5_000, 1.0, 0.2)), span_hours=24)
+    assert same["status"] == "STABLE" and all(f["psi"] < 0.1 for f in same["features"])
+
+    moved = drift.compare(ref, rows(sample(5_000, 3.0, 0.6)), span_hours=24)
+    by = {f["feature"]: f for f in moved["features"]}
+    assert moved["status"] == "DRIFTED"
+    assert by["amount"]["status"] == "DRIFTED" and by["is_transfer"]["status"] == "DRIFTED"
+    assert by["hour_of_day"]["status"] == "STABLE"
+
+    # Too little traffic, or less than a day for clock-driven features: say so instead of judging.
+    assert drift.compare(ref, rows(sample(100, 1.0, 0.2)), span_hours=24)["status"] == "NOT_ENOUGH_DATA"
+    short = drift.compare(ref, rows(sample(5_000, 1.0, 0.2)), span_hours=1)
+    assert {f["feature"]: f["status"] for f in short["features"]}["hour_of_day"] == "NEEDS_24H"

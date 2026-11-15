@@ -438,6 +438,18 @@ class Repository:
             "feature_ms": pct(row["feature"]),       # Redis read + update
         }
 
+    def recent_features(self, hours: int = 24, limit: int = 20_000) -> tuple[list[dict], float]:
+        """Feature values of the most recent live predictions, and the hours they span."""
+        with self.pool.connection() as c:
+            rows = c.execute(
+                f"""SELECT features, persisted_at FROM predictions
+                    WHERE persisted_at > clock_timestamp() - make_interval(hours => %s) AND {LIVE_SOURCES_SQL}
+                    ORDER BY persisted_at DESC LIMIT %s""", (hours, limit)).fetchall()
+        if not rows:
+            return [], 0.0
+        span = (rows[0]["persisted_at"] - rows[-1]["persisted_at"]).total_seconds() / 3600
+        return [r["features"] for r in rows], span
+
 
 def connect_with_retry(dsn: str, attempts: int = 30) -> Repository:
     for i in range(attempts):

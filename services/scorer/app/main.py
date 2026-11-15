@@ -25,7 +25,7 @@ import redis
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from fraudlib import jsonlog
+from fraudlib import drift, jsonlog
 from fraudlib.config import Settings, get_settings
 from fraudlib.features import RedisFeatureStore
 from fraudlib.policy import Policy
@@ -399,6 +399,24 @@ def stats(request: Request, source: Source | None = None, _: Principal = Depends
 @app.get("/v1/performance")
 def performance(request: Request, _: Principal = Depends(can_read)) -> Response:
     return json_response(request.app.state.live.performance())
+
+
+@app.get("/v1/model/drift")
+def model_drift(request: Request, _: Principal = Depends(can_read)) -> Response:
+    """Live feature distributions against the model's training data (PSI). Recomputed at most once a minute."""
+    st = request.app.state
+    cached = getattr(st, "drift_cache", None)
+    if cached and time.monotonic() - cached[0] < 60:
+        return json_response(cached[1])
+    out = {"model_version": st.scorer.model_version, "measured_at": datetime.now(UTC).isoformat()}
+    if st.scorer.reference is None:
+        out.update({"status": "NO_REFERENCE", "features": []})
+    else:
+        rows, span = st.repo.recent_features()
+        out.update(drift.compare(st.scorer.reference, rows, span))
+        out["reference_data"] = st.scorer.reference.get("data")
+    st.drift_cache = (time.monotonic(), out)
+    return json_response(out)
 
 
 # ---- investigation -------------------------------------------------------------------

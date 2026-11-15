@@ -96,6 +96,13 @@ async function send(id) {
   spawn("bash", ["-c", API_START], { detached: true, stdio: "ignore" }).unref();
   await pill.filter({ hasText: /LIVE|IDLE/ }).waitFor({ timeout: 60000 });
   check("page reconnects by itself, no reload", navigations === before);
+
+  // 7. Model health: the drift panel shows a real comparison, or says plainly why it cannot.
+  await page.locator("nav.tabs button", { hasText: /performance/i }).click();
+  const health = page.getByTestId("model-health");
+  await health.getByText(/Overall:|Not enough|no training reference/i).first().waitFor({ timeout: 15000 });
+  await page.screenshot({ path: `${dir}/5-model-health.png`, fullPage: true });
+  check("model health panel reports drift status", true, (await health.locator("p.note, .empty").first().innerText()).slice(0, 110));
   await browser.close();
   process.exit(results.every((r) => r.ok) ? 0 : 1);
 })().catch((e) => { console.error("FAIL", e.message); process.exit(1); });

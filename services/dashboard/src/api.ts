@@ -101,6 +101,14 @@ export interface Policy {
 }
 
 const q = (source: Source | null) => (source ? `source=${source}` : "");
+export type DriftStatus = "STABLE" | "WATCH" | "DRIFTED" | "NEEDS_24H" | "NOT_ENOUGH_DATA" | "NO_REFERENCE";
+export interface Drift {
+  model_version: string; measured_at: string; status: DriftStatus;
+  rows?: number; min_rows?: number; span_hours?: number; reference_rows?: number; reference_data?: string;
+  watch_above?: number; drifted_above?: number;
+  features: { feature: string; psi: number; status: DriftStatus }[];
+}
+
 export const api = {
   login: async (username: string, password: string) => {
     const r = await call<Me & { token: string }>("/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
@@ -115,6 +123,7 @@ export const api = {
   changeUser: (username: string, body: { role?: Role; active?: boolean; password?: string }) =>
     call<User>(`/v1/users/${encodeURIComponent(username)}`, { method: "PATCH", body: JSON.stringify(body) }),
   audit: () => call<AuditRow[]>("/v1/audit?limit=200"),
+  drift: () => call<Drift>("/v1/model/drift"),
   stats: (source: Source | null) => call<Stats>(`/v1/stats?${q(source)}`),
   recent: (limit: number, source: Source | null) => call<Txn[]>(`/v1/transactions/recent?limit=${limit}&${q(source)}`),
   transaction: (id: string) => call<TxnDetail>(`/v1/transactions/${encodeURIComponent(id)}`),

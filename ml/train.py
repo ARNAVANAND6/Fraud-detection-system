@@ -35,6 +35,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "libs"))
+from fraudlib.drift import build_reference
 from fraudlib.features import FEATURE_NAMES, build_feature_matrix
 from fraudlib.rules import evaluate_rules
 from fraudlib.schemas import TxnType
@@ -201,6 +202,11 @@ def main() -> None:
         "data": str(a.data), "rows": len(y),
     }
     (out_dir / "model_meta.json").write_text(json.dumps(meta, indent=2))
+    # What the model's inputs looked like in training, for drift monitoring at run time.
+    reference = build_reference(X[tr].to_numpy(), FEATURE_NAMES)
+    reference.update({"model_version": a.version, "data": str(a.data), "split": "train (first 70% by time)",
+                      "built_at": meta["trained_at"]})
+    (out_dir / "reference.json").write_text(json.dumps(reference, indent=2))
     Path("reports").mkdir(exist_ok=True)
     report = {"meta": meta, "results": results, "lightgbm_gain_importance": importance,
               "caveat": ("PaySim: a public simulator of mobile-money transfers, not real UPI or bank data; "

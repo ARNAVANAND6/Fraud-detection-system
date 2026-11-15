@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Alert, AlertDetail, AlertStatus, AuditRow, LEVELS, Me, Pct, Policy, RiskLevel, Role, SOURCE_LABEL, Source, Stats, Txn,
+  Alert, AlertDetail, AlertStatus, AuditRow, Drift, DriftStatus, LEVELS, Me, Pct, Policy, RiskLevel, Role, SOURCE_LABEL, Source, Stats, Txn,
   TxnDetail, User, api, session,
 } from "./api";
 import { LEVEL_COLOR, LEVEL_ICON, MinuteSeries, RiskDistribution } from "./charts";
@@ -441,7 +441,57 @@ function PerformanceTab({ live }: { live: Live }) {
           {live.status?.pipeline_mode === "spark" && " In this mode every event waits for a Spark micro-batch before scoring, which dominates end-to-end latency."}
         </p>
       </div>
+      <ModelHealth />
     </>
+  );
+}
+
+const DRIFT_TEXT: Record<DriftStatus, string> = {
+  STABLE: "Stable", WATCH: "Watch", DRIFTED: "Drifted", NEEDS_24H: "Needs 24 h of traffic",
+  NOT_ENOUGH_DATA: "Not enough data", NO_REFERENCE: "No reference",
+};
+
+function ModelHealth() {
+  const [d, setD] = useState<Drift | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    let stop = false;
+    const load = () => api.drift().then((r) => { if (!stop) { setD(r); setErr(null); } })
+      .catch((e) => { if (!stop) setErr((e as Error).message); });
+    load();
+    const t = setInterval(load, 60_000);
+    return () => { stop = true; clearInterval(t); };
+  }, []);
+  return (
+    <div className="panel" data-testid="model-health">
+      <h3>Model health <span className="muted">live inputs compared with the data the model was trained on</span></h3>
+      {err && <p className="note">Could not load the comparison: {err}</p>}
+      {!d && !err && <div className="empty">Loading.</div>}
+      {d?.status === "NO_REFERENCE" && <div className="empty">Model {d.model_version} has no training reference, so drift cannot be measured. Run ml/build_reference.py for it.</div>}
+      {d?.status === "NOT_ENOUGH_DATA" && <div className="empty">Only {num(d.rows ?? 0)} live transactions in the last 24 hours. At least {num(d.min_rows ?? 0)} are needed for a comparison.</div>}
+      {d && d.features.length > 0 && (
+        <>
+          <p className="note">
+            Overall: <span className={`drift ${d.status}`}>{DRIFT_TEXT[d.status]}</span>. Model {d.model_version}, {num(d.rows ?? 0)} live
+            transactions over {(d.span_hours ?? 0).toFixed(1)} h against {num(d.reference_rows ?? 0)} training rows. Measured at {clock(d.measured_at)}.
+          </p>
+          <table>
+            <thead><tr><th>Model input</th><th className="r">PSI</th><th>Reading</th></tr></thead>
+            <tbody>
+              {d.features.map((f) => (
+                <tr key={f.feature}><td>{f.feature}</td><td className="r">{f.psi.toFixed(3)}</td>
+                  <td><span className={`drift ${f.status}`}>{DRIFT_TEXT[f.status]}</span></td></tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="note">
+            PSI (population stability index) measures how far a model input has moved from training: above {d.watch_above} is worth
+            watching, above {d.drifted_above} has drifted. Drift means the inputs changed. It does not by itself mean the model is
+            wrong; confirmed labels decide that. Training data: {d.reference_data ?? "unknown"}.
+          </p>
+        </>
+      )}
+    </div>
   );
 }
 
