@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -146,6 +147,9 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--alert-rate", type=float, default=0.01, help="share of traffic analysts can review")
     ap.add_argument("--version", default=datetime.now(UTC).strftime("v%Y%m%d%H%M"))
+    ap.add_argument("--device", choices=["cpu", "gpu", "cuda"], default=os.environ.get("TRAIN_DEVICE", "cpu"),
+                    help="where LightGBM trains: gpu needs an OpenCL-enabled LightGBM, cuda a CUDA build. "
+                         "Only LightGBM uses it; the other models and the feature build stay on the CPU.")
     a = ap.parse_args()
 
     cols, times, y = load_columns(a.data, a.paysim, a.limit)
@@ -171,15 +175,18 @@ def main() -> None:
                                        # thousands (PaySim: ~1,800) lets leaf values run away and the
                                        # scores saturate at 1.0.
                                        max_delta_step=1.0,
+                                       device_type=a.device,
                                        random_state=0, verbose=-1),
     }
     # XGBoost slots in the same way (xgboost.XGBClassifier) once installed.
-    results, fitted = {}, {}
+    results, fitted, fit_seconds = {}, {}, {}
     for name, model in models.items():
         if model is None:
             score_fn = lambda df: rules_scores(df.to_numpy())
         else:
+            t_fit = time.perf_counter()
             model.fit(X[tr], y[tr])
+            fit_seconds[name] = round(time.perf_counter() - t_fit, 1)
             fitted[name] = model
             score_fn = lambda df, m=model: m.predict_proba(df)[:, 1]
         p_val, p_test = score_fn(X[va]), score_fn(X[te])
@@ -200,6 +207,7 @@ def main() -> None:
         "threshold_review": results["lightgbm"]["validation"]["threshold"],
         "alert_rate": a.alert_rate, "trained_at": datetime.now(UTC).isoformat(),
         "data": str(a.data), "rows": len(y),
+        "lightgbm_device": a.device, "fit_seconds": fit_seconds,
     }
     (out_dir / "model_meta.json").write_text(json.dumps(meta, indent=2))
     # What the model's inputs looked like in training, for drift monitoring at run time.
