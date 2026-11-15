@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 
 import psycopg
 import redis
-from confluent_kafka import Consumer, KafkaError, Producer
+from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 from fraudlib import jsonlog
 from fraudlib.config import get_settings
 from fraudlib.features import RedisFeatureStore
@@ -38,6 +38,9 @@ log = logging.getLogger("scorer")
 INFRA_ERRORS = (psycopg.OperationalError, psycopg.InterfaceError, redis.ConnectionError, redis.TimeoutError)
 HEARTBEAT_KEY = "hb:scorer"
 MAX_ATTEMPTS = 3
+# Commit failures that mean "this consumer left the group", not data loss.
+REJOIN_ERRORS = {KafkaError._ASSIGNMENT_LOST, KafkaError._NO_OFFSET, KafkaError.ILLEGAL_GENERATION,
+                 KafkaError.UNKNOWN_MEMBER_ID, KafkaError.REBALANCE_IN_PROGRESS, KafkaError._STATE}
 
 
 def alert_event(alert: dict, kind: str) -> dict:
@@ -166,6 +169,25 @@ class ScoringWorker:
                     return
                 time.sleep(0.2 * attempt)
 
+    def commit(self) -> None:
+        """Commit offsets only after side effects are durable.
+
+        If the group dropped this consumer (machine sleep, a long pause, broker
+        restart), the commit fails with a lost assignment. That must not stop the
+        scorer: the consumer rejoins on the next poll and the uncommitted events are
+        replayed, which is safe because every sink is keyed on transaction_id.
+        """
+        try:
+            self.consumer.commit(asynchronous=False)
+        except KafkaException as exc:
+            code = exc.args[0].code() if exc.args else None
+            if code in REJOIN_ERRORS:
+                RETRIES.labels("rebalance").inc()
+                log.warning("offset commit skipped, consumer will rejoin and replay",
+                            extra={"error": str(exc)[:200]})
+                return
+            raise
+
     # ---- main loop ---------------------------------------------------------------
     def run(self) -> None:
         s = self.s
@@ -195,7 +217,7 @@ class ScoringWorker:
                 self.process_with_retry(msg)
             if msgs and self.running:
                 self.producer.flush(10)
-                self.consumer.commit(asynchronous=False)  # only after side effects are durable
+                self.commit()
             try:
                 self.housekeeping()
             except INFRA_ERRORS as exc:
