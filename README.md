@@ -232,7 +232,8 @@ On 15 Nov 2026 the images were built from this repository's Dockerfiles and the
 whole stack ran from `docker compose --profile app --profile tls up` (direct
 mode): all ten acceptance tests passed, and the browser check passed 17 of 17
 through the HTTPS proxy. The sandbox added only its own proxy certificate to
-the base images. Spark mode has not been re-run in containers since 13 Nov.
+the base images. The same ten acceptance tests also passed in Spark mode with
+Spark running in its container.
 
 ### The ten acceptance tests
 
