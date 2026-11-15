@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from confluent_kafka import Consumer, KafkaException, TopicPartition
 from fraudlib.config import Settings
 
+from . import nodes
 from .gateway import percentiles
 from .metrics import SSE_CLIENTS
 
@@ -67,6 +68,9 @@ class LiveState:
         self.dirty = True
         self.latest_stats: dict | None = None
         self.scorer: dict | None = None
+        self.nodes: list[dict] | None = None
+        self.node = nodes.node_id()
+        self.started_at = datetime.now(UTC).isoformat()
 
     # ---- Kafka side (background thread) -------------------------------------------
     def _end_offsets(self, probe: Consumer, topic: str) -> tuple[list[TopicPartition], int]:
@@ -162,6 +166,11 @@ class LiveState:
                 reasons.append("Pipeline healthy, no events arriving")
         else:
             state = "LIVE"
+        recent = now.timestamp() - 600
+        for n in self.nodes or []:
+            if not n["alive"] and datetime.fromisoformat(n["last_seen"]).timestamp() > recent:
+                reasons.append(f"{n['kind'].capitalize()} node {n['id']} stopped reporting "
+                               f"at {n['last_seen'][11:19]} UTC")
         stats = self.latest_stats or {}
         return {
             "environment": s.environment, "pipeline_mode": s.pipeline_mode, "server_time": now.isoformat(),
@@ -174,6 +183,8 @@ class LiveState:
             "seconds_since_last_event": round(since, 1) if since is not None else None,
             "active_sources": [r["source"] for r in stats.get("by_source", []) if r["last_minute"] > 0],
             "dashboard_clients": len(self.hub.clients),
+            "node": self.node,
+            "nodes": self.nodes or [],
         }
 
     def performance(self) -> dict:
@@ -189,16 +200,25 @@ class LiveState:
         })
         return perf
 
-    def _read_scorer_heartbeat(self) -> dict | None:
+    def _beat_and_read_nodes(self) -> list[dict] | None:
         try:
-            raw = self.redis.get("hb:scorer")
-            return json.loads(raw) if raw else None
-        except Exception:  # noqa: BLE001 - Redis down means we cannot confirm the scorer
+            nodes.beat(self.redis, "api", self.node, {
+                "dashboard_clients": len(self.hub.clients), "started_at": self.started_at})
+            return nodes.read(self.redis)
+        except Exception:  # noqa: BLE001 - Redis down means we cannot confirm any node
             return None
 
     async def _status_loop(self) -> None:
         while True:
-            self.scorer = await asyncio.to_thread(self._read_scorer_heartbeat)
+            self.nodes = await asyncio.to_thread(self._beat_and_read_nodes)
+            live = [n for n in self.nodes or [] if n["kind"] == "scorer" and n["alive"]]
+            # Several scorers share the work: report them together, newest model first.
+            self.scorer = None if not live else {
+                "model_version": live[0].get("model_version"),
+                "duplicates": sum(n.get("duplicates") or 0 for n in live),
+                "last_received_at": max((n["last_received_at"] for n in live if n.get("last_received_at")),
+                                        default=None),
+            }
             self.hub.publish("status", self.status())
             await asyncio.sleep(1)
 
@@ -230,5 +250,9 @@ class LiveState:
 
     async def shutdown(self) -> None:
         self.stop.set()
+        try:
+            await asyncio.to_thread(nodes.leave, self.redis, "api", self.node)
+        except Exception:  # noqa: BLE001
+            pass
         for t in self.tasks:
             t.cancel()

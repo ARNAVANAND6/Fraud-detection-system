@@ -10,10 +10,12 @@ Run this with a single worker: the SSE hub lives in process memory.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import random
 import re
+import secrets
 import time
 import uuid
 from collections import defaultdict, deque
@@ -44,15 +46,14 @@ MAX_IMPORT_ROWS = 500_000
 
 
 class RateLimiter:
-    """Sliding-window limit per API key. In-process only: with several API
-    replicas this would move to Redis (INCR + EXPIRE)."""
+    """Sliding one-minute limit per API key, counted in Redis so it holds across
+    API replicas and restarts. Falls back to this process's memory if Redis is down."""
 
-    def __init__(self, per_minute: int):
-        self.per_minute = per_minute
+    def __init__(self, per_minute: int, redis=None):
+        self.per_minute, self.redis = per_minute, redis
         self.hits: dict[str, deque] = defaultdict(deque)
 
-    def allow(self, key: str) -> bool:
-        now = time.monotonic()
+    def _allow_local(self, key: str, now: float) -> bool:
         q = self.hits[key]
         while q and now - q[0] > 60:
             q.popleft()
@@ -61,6 +62,26 @@ class RateLimiter:
         q.append(now)
         return True
 
+    def allow(self, key: str) -> bool:
+        now = time.time()
+        if self.redis is None:
+            return self._allow_local(key, now)
+        rk = "rl:" + hashlib.sha256(key.encode()).hexdigest()[:32]
+        member = f"{now:.6f}|{secrets.token_hex(4)}"
+        try:
+            p = self.redis.pipeline(transaction=True)
+            p.zremrangebyscore(rk, "-inf", now - 60)
+            p.zadd(rk, {member: now})
+            p.zcard(rk)
+            p.expire(rk, 61)
+            count = p.execute()[2]
+            if count > self.per_minute:
+                self.redis.zrem(rk, member)    # refused requests do not use up the allowance
+                return False
+            return True
+        except redis.RedisError:
+            return self._allow_local(key, now)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -68,8 +89,6 @@ async def lifespan(app: FastAPI):
     s.assert_safe_for_production()
     st = app.state
     st.settings = s
-    st.limiter = RateLimiter(s.rate_limit_per_minute)
-    st.login_throttle = auth.LoginThrottle()
     injected = hasattr(st, "repo")  # unit tests inject fakes and skip Kafka
     if not injected:
         from .live import LiveState
@@ -85,6 +104,8 @@ async def lifespan(app: FastAPI):
         st.gateway = Gateway(s, st.redis)
         st.live = LiveState(s, st.repo, st.redis, st.gateway)
         await st.live.start()
+    st.limiter = RateLimiter(s.rate_limit_per_minute, st.redis)
+    st.login_throttle = auth.LoginThrottle(st.redis)
     yield
     if not injected:
         await st.live.shutdown()

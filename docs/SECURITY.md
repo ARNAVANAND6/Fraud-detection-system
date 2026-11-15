@@ -14,7 +14,8 @@ a recorded check. Nothing here is a certification.
 | Machine | `X-API-Key` header | send transactions, dry-run scores, read. Nothing else |
 
 - Passwords: salted scrypt hashes (n = 2^14), minimum 10 characters. Plain passwords are never stored or logged.
-- Lock-out: five failed sign-ins for one username from one address block that pair for 15 minutes.
+- Lock-out: five failed sign-ins for one username from one address block that pair for 15 minutes. The count is
+  kept in Redis (under a digest, not the username), so it holds across API replicas and restarts.
 - Sessions: a random token, valid 8 hours. Only its SHA-256 digest is stored. Changing a person's role or
   password, or deactivating them, ends their sessions immediately.
 - The last active administrator cannot be demoted or deactivated.
@@ -69,7 +70,6 @@ These are the items a bank's security review will ask for and will not find:
 - Tamper-evident audit log. A database administrator can still change `audit_log`.
 - Field-level masking or tokenisation of account identifiers.
 - TLS and authentication between the internal services (Kafka, Redis, PostgreSQL).
-- Lock-out and rate limits are kept in the API process: they reset on restart and are per replica.
 - An independent penetration test, and any certification or attestation: ISO 27001, SOC 2, PCI DSS.
 - A data-protection assessment under India's DPDP Act, and RBI outsourcing and data-localisation requirements.
   These depend on the deploying organisation and need legal and compliance work, not code.
