@@ -79,6 +79,7 @@ services:
       PGDATABASE: vyrox_${ENVIRONMENT:-demo}
       BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
       BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
     volumes:
       - ./tools:/tools:ro
       - ./backups:/backups

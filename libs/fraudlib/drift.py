@@ -65,7 +65,7 @@ def compare(reference: dict, rows: list[dict], span_hours: float) -> dict:
         return {"status": "NOT_ENOUGH_DATA", "rows": n, "min_rows": MIN_ROWS, "features": []}
     out = []
     for name, ref in reference["features"].items():
-        values = np.array([r[name] for r in rows if name in r], dtype=np.float64)
+        values = np.array([r[name] for r in rows if r.get(name) is not None], dtype=np.float64)
         if len(values) < MIN_ROWS:
             continue
         value = psi(np.array(ref["shares"]), _shares(values, ref["edges"]))

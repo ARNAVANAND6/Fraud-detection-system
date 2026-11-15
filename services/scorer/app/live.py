@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from confluent_kafka import Consumer, KafkaException, TopicPartition
 from fraudlib.config import Settings
 
-from . import nodes
+from . import nodes, notify
 from .gateway import percentiles
 from .metrics import SSE_CLIENTS
 
@@ -219,8 +219,24 @@ class LiveState:
                 "last_received_at": max((n["last_received_at"] for n in live if n.get("last_received_at")),
                                         default=None),
             }
-            self.hub.publish("status", self.status())
+            st = self.status()
+            await asyncio.to_thread(self._notify, st)
+            self.hub.publish("status", st)
             await asyncio.sleep(1)
+
+    def _notify(self, st: dict) -> None:
+        url = self.s.alert_webhook_url
+        if not url:
+            return
+        if st["stream_status"] == "DISCONNECTED":
+            notify.send(self.redis, url, "disconnected",
+                        "VYROX: stream DISCONNECTED: " + "; ".join(st["reasons"]))
+        cutoff = time.time() - 600
+        for n in st["nodes"]:
+            # Only nodes that stopped recently: an old, deliberately removed node is not news.
+            if not n["alive"] and datetime.fromisoformat(n["last_seen"]).timestamp() > cutoff:
+                notify.send(self.redis, url, f"down:{n['kind']}:{n['id']}",
+                            f"VYROX: {n['kind']} node {n['id']} stopped reporting at {n['last_seen']}")
 
     async def _stats_loop(self) -> None:
         while True:

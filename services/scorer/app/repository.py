@@ -3,6 +3,7 @@ database transaction, keyed on transaction_id, so a replay changes nothing."""
 from __future__ import annotations
 
 import json
+import math
 import time
 from datetime import datetime
 
@@ -25,6 +26,11 @@ LIVE_SOURCES_SQL = "source <> 'HISTORICAL_IMPORT'"
 
 class InvalidTransition(Exception):
     pass
+
+
+def _json_safe(features: dict) -> dict:
+    """PostgreSQL JSON has no NaN: a missing feature (unknown balance) is stored as null."""
+    return {k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in features.items()}
 
 
 class Repository:
@@ -242,7 +248,7 @@ class Repository:
                 (event.transaction_id, source.value, event.account_id, event.counterparty_id,
                  event.txn_type.value, event.amount, event.region, event.event_time, ingested_at,
                  score.scored_at, score.risk_score, score.risk_level.value, score.decision.value,
-                 score.reason_codes, score.model_version, json.dumps(features), feature_ms,
+                 score.reason_codes, score.model_version, json.dumps(_json_safe(features)), feature_ms,
                  score.latency_ms, ingested_at),
             ).fetchone()
             if row is None:

@@ -36,8 +36,17 @@ from fraudlib.scoring import Scorer
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ValidationError
 
-from . import auth, mfa, sso
-from .auth import Principal, admin_only, can_ingest, can_read, can_work_alerts, signed_in, signed_in_or_enrolling
+from . import auth, connectors, mfa, sso
+from .auth import (
+    Principal,
+    admin_only,
+    can_dry_run,
+    can_ingest,
+    can_read,
+    can_work_alerts,
+    signed_in,
+    signed_in_or_enrolling,
+)
 from .gateway import Gateway, PublishError, verify_webhook
 from .metrics import API_LATENCY
 
@@ -406,14 +415,67 @@ async def webhook(request: Request, x_vyrox_timestamp: str | None = Header(defau
     s: Settings = request.app.state.settings
     problem = verify_webhook(s.webhook_secret, x_vyrox_timestamp, x_vyrox_signature, body)
     if problem:
+        connectors.record(request.app.state.redis, "generic", problem)
         raise HTTPException(status_code=503 if "not configured" in problem else 401, detail=problem)
     try:
         envelope = WebhookEnvelope.model_validate_json(body)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=json.loads(exc.json(include_url=False))) from None
     result = await asyncio.to_thread(do_ingest, request, [envelope.data], Source.LIVE_WEBHOOK)
+    connectors.record(request.app.state.redis, "generic")
     return {"event_id": envelope.event_id, "transaction_id": envelope.data.transaction_id,
             "source": Source.LIVE_WEBHOOK.value, "status": "accepted" if result["accepted"] else "duplicate"}
+
+
+async def _gateway_webhook(request: Request, name: str, secret: str, verify, mapper) -> dict:
+    """Shared path for the Razorpay and Stripe webhooks (connectors.py)."""
+    st = request.app.state
+    if not secret:
+        raise HTTPException(status_code=503, detail=f"the {name} connector is not configured")
+    body = await request.body()
+    try:
+        verify(body)
+        event = mapper(body, st.settings.secret_key, st.settings.connector_currencies)
+    except connectors.Rejected as exc:
+        connectors.record(st.redis, name, str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except connectors.Ignored as exc:
+        # 200 so the provider does not retry an event we will never score.
+        return {"status": "ignored", "reason": str(exc)}
+    except ValidationError as exc:
+        connectors.record(st.redis, name, "mapped event failed validation")
+        raise HTTPException(status_code=422, detail=json.loads(exc.json(include_url=False))) from None
+    try:
+        result = await asyncio.to_thread(do_ingest, request, [event], Source.LIVE_WEBHOOK)
+    except HTTPException as exc:
+        connectors.record(st.redis, name, str(exc.detail))
+        raise                                          # 503: the provider retries later
+    connectors.record(st.redis, name)
+    return {"status": "accepted" if result["accepted"] else "duplicate", "transaction_id": event.transaction_id,
+            "source": Source.LIVE_WEBHOOK.value}
+
+
+@app.post("/v1/connectors/razorpay/webhook")
+async def razorpay_webhook(request: Request, x_razorpay_signature: str | None = Header(default=None)) -> dict:
+    secret = request.app.state.settings.razorpay_webhook_secret
+    return await _gateway_webhook(
+        request, "razorpay", secret, lambda body: connectors.verify_razorpay(secret, body, x_razorpay_signature),
+        connectors.map_razorpay)
+
+
+@app.post("/v1/connectors/stripe/webhook")
+async def stripe_webhook(request: Request, stripe_signature: str | None = Header(default=None)) -> dict:
+    secret = request.app.state.settings.stripe_webhook_secret
+    return await _gateway_webhook(
+        request, "stripe", secret, lambda body: connectors.verify_stripe(secret, body, stripe_signature),
+        connectors.map_stripe)
+
+
+@app.get("/v1/connectors")
+def list_connectors(request: Request, _: Principal = Depends(can_read)) -> Response:
+    st = request.app.state
+    return json_response({"connectors": connectors.status(st.redis, st.settings),
+                          "alert_webhook_configured": bool(st.settings.alert_webhook_url)})
 
 
 @app.post("/v1/imports", status_code=202)
@@ -489,7 +551,7 @@ def demo_scenario(body: ScenarioRequest, request: Request, who: Principal = Depe
 
 
 @app.post("/v1/score", response_model=RiskScore)
-def score(event: TransactionEvent, request: Request, who: Principal = Depends(can_ingest)) -> RiskScore:
+def score(event: TransactionEvent, request: Request, who: Principal = Depends(can_dry_run)) -> RiskScore:
     """Dry run: scores with current features without storing anything or changing feature state."""
     st = request.app.state
     try:
