@@ -225,10 +225,14 @@ and does not claim to be.
 
 ## Verified results
 
-Run on 13 Nov 2026 in a 4-core, 16 GB Linux sandbox. Kafka, Redis, PostgreSQL
-and Spark ran in Docker; the Python services ran on the host because image
-builds were blocked by that sandbox's network policy. The compose files for
-the Python services are therefore **untested in this exact form**.
+First run on 13 Nov 2026 in a 4-core, 16 GB Linux sandbox, with Kafka, Redis,
+PostgreSQL and Spark in Docker and the Python services on the host.
+
+On 15 Nov 2026 the images were built from this repository's Dockerfiles and the
+whole stack ran from `docker compose --profile app --profile tls up` (direct
+mode): all ten acceptance tests passed, and the browser check passed 17 of 17
+through the HTTPS proxy. The sandbox added only its own proxy certificate to
+the base images. Spark mode has not been re-run in containers since 13 Nov.
 
 ### The ten acceptance tests
 
@@ -308,7 +312,6 @@ the training data.
 ## Known gaps
 
 - No real payment-gateway adapter and no live UPI, bank or card data.
-- The compose definitions of the Python services and the dashboard image were not built in the test sandbox.
 - The SSE hub is in process memory: run one API worker. More replicas need Redis pub/sub or one Kafka consumer per replica (already how events arrive).
 - Dashboard analytics run aggregate queries over the whole `predictions` table every 2 seconds. Fine for a demo, not for millions of rows.
 - The fan-in feature shares state across accounts; with several scorer replicas two senders to one destination scored at the same instant can miss each other.
