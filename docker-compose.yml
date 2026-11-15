@@ -67,6 +67,26 @@ services:
       - ./db/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck: { test: ["CMD-SHELL", "pg_isready -U fraud -d vyrox_${ENVIRONMENT:-demo}"], interval: 5s, retries: 20 }
 
+  # Scheduled database backups:  docker compose --profile backup up -d
+  # Archives land in ./backups. Copy them off this machine: a backup on the same disk is not a backup.
+  backup:
+    image: postgres:16-alpine
+    profiles: [backup]
+    environment:
+      PGHOST: postgres
+      PGUSER: fraud
+      PGPASSWORD: ${POSTGRES_PASSWORD:-fraud}
+      PGDATABASE: vyrox_${ENVIRONMENT:-demo}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+    volumes:
+      - ./tools:/tools:ro
+      - ./backups:/backups
+    entrypoint: ["sh", "/tools/backup-loop.sh"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
   generator:
     <<: *python
     profiles: [app]
