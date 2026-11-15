@@ -13,10 +13,15 @@ DEMO_WEBHOOK_SECRET = "demo-webhook-secret"
 DEMO_API_KEY = "dev-key"
 DEMO_ADMIN_USERNAME = "admin"
 DEMO_ADMIN_PASSWORD = "vyrox-demo-admin"  # demo only; production refuses to start with it
+DEMO_SECRET_KEY = "vyrox-demo-secret-key"  # demo only; encrypts 2FA secrets, signs SSO state
 
 
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
+
+
+def _env_list(name: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in _env(name, "").split(",") if item.strip())
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,26 @@ class Settings:
     # First administrator, created at start-up if no such user exists yet.
     admin_username: str = field(default_factory=lambda: _env("ADMIN_USERNAME", DEMO_ADMIN_USERNAME).lower())
     admin_password: str = field(default_factory=lambda: _env("ADMIN_PASSWORD", DEMO_ADMIN_PASSWORD))
+    # Encrypts two-factor secrets at rest. Changing it invalidates every enrolled authenticator.
+    secret_key: str = field(default_factory=lambda: _env("SECRET_KEY", DEMO_SECRET_KEY))
+    # Roles that must use two-factor sign-in; a password alone is refused once they have enrolled,
+    # and they are told to enrol when they have not. Empty = optional for everyone.
+    mfa_required_roles: tuple[str, ...] = field(
+        default_factory=lambda: tuple(r.upper() for r in _env_list("MFA_REQUIRED_ROLES")))
+    # Single sign-on (OpenID Connect). Off unless OIDC_ISSUER and OIDC_CLIENT_ID are set.
+    oidc_issuer: str = field(default_factory=lambda: _env("OIDC_ISSUER", "").rstrip("/"))
+    oidc_client_id: str = field(default_factory=lambda: _env("OIDC_CLIENT_ID", ""))
+    oidc_client_secret: str = field(default_factory=lambda: _env("OIDC_CLIENT_SECRET", ""))
+    oidc_provider_name: str = field(default_factory=lambda: _env("OIDC_PROVIDER_NAME", "single sign-on"))
+    # Public URL of /v1/auth/sso/callback as the browser reaches it; registered with the provider.
+    oidc_redirect_url: str = field(default_factory=lambda: _env("OIDC_REDIRECT_URL", ""))
+    # Where to send the browser after sign-in (the dashboard).
+    dashboard_url: str = field(default_factory=lambda: _env("DASHBOARD_URL", "http://localhost:3000").rstrip("/"))
+    # People who sign in with SSO but have no account yet get one with this role, if their e-mail
+    # domain is listed. Empty list = only people an administrator added (by e-mail) can sign in.
+    oidc_allowed_domains: tuple[str, ...] = field(
+        default_factory=lambda: tuple(d.lower() for d in _env_list("OIDC_ALLOWED_DOMAINS")))
+    oidc_default_role: str = field(default_factory=lambda: _env("OIDC_DEFAULT_ROLE", "VIEWER").upper())
     rate_limit_per_minute: int = field(default_factory=lambda: int(_env("RATE_LIMIT_PER_MINUTE", "6000")))
     cors_origins: tuple[str, ...] = field(
         default_factory=lambda: tuple(_env("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(","))
@@ -50,6 +75,10 @@ class Settings:
             raise ValueError("ENVIRONMENT must be 'demo' or 'production'")
         if self.pipeline_mode not in ("spark", "direct"):
             raise ValueError("PIPELINE_MODE must be 'spark' or 'direct'")
+
+    @property
+    def sso_enabled(self) -> bool:
+        return bool(self.oidc_issuer and self.oidc_client_id and self.oidc_redirect_url)
 
     def topic(self, name: str) -> str:
         return f"{self.environment}.payments.{name}.v1"
@@ -93,6 +122,8 @@ class Settings:
             problems.append("WEBHOOK_SECRET is unset or the demo secret")
         if self.admin_password == DEMO_ADMIN_PASSWORD:
             problems.append("ADMIN_PASSWORD is unset or the demo password")
+        if self.secret_key == DEMO_SECRET_KEY or len(self.secret_key) < 32:
+            problems.append("SECRET_KEY is unset, the demo key, or shorter than 32 characters")
         if problems:
             raise RuntimeError("Unsafe production config: " + "; ".join(problems))
 

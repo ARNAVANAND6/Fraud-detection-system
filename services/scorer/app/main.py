@@ -24,7 +24,7 @@ from typing import Literal
 import redis
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fraudlib import drift, jsonlog
 from fraudlib.config import Settings, get_settings
 from fraudlib.features import RedisFeatureStore
@@ -34,8 +34,8 @@ from fraudlib.scoring import Scorer
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ValidationError
 
-from . import auth
-from .auth import Principal, admin_only, can_ingest, can_read, can_work_alerts, signed_in
+from . import auth, mfa, sso
+from .auth import Principal, admin_only, can_ingest, can_read, can_work_alerts, signed_in, signed_in_or_enrolling
 from .gateway import Gateway, PublishError, verify_webhook
 from .metrics import API_LATENCY
 
@@ -131,12 +131,41 @@ class NewUser(BaseModel):
     username: str
     password: str
     role: Literal["VIEWER", "ANALYST", "ADMIN"]
+    email: str | None = None   # lets this person sign in with single sign-on
 
 
 class UserChange(BaseModel):
     role: Literal["VIEWER", "ANALYST", "ADMIN"] | None = None
     active: bool | None = None
     password: str | None = None
+    reset_mfa: bool = False    # for someone who lost their phone and recovery codes
+    email: str | None = None
+
+
+class SecondFactor(BaseModel):
+    mfa_token: str
+    code: str
+
+
+class MfaCode(BaseModel):
+    code: str
+
+
+class MfaDisable(BaseModel):
+    password: str
+    code: str
+
+
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+
+def clean_email(email: str | None) -> str | None:
+    if email is None or not email.strip():
+        return None
+    email = email.strip().lower()
+    if not EMAIL_RE.fullmatch(email):
+        raise HTTPException(status_code=422, detail="email: not an e-mail address")
+    return email
 
 
 @app.post("/v1/auth/login")
@@ -144,8 +173,93 @@ def login(body: LoginRequest, request: Request) -> Response:
     return json_response(auth.login(request, body.username, body.password))
 
 
+@app.post("/v1/auth/login/mfa")
+def login_mfa(body: SecondFactor, request: Request) -> Response:
+    """Second step of a sign-in for people with two-factor sign-in: authenticator code or recovery code."""
+    return json_response(auth.login_second_factor(request, body.mfa_token, body.code))
+
+
+@app.get("/v1/auth/mfa")
+def mfa_status(request: Request, who: Principal = Depends(signed_in_or_enrolling)) -> dict:
+    user = request.app.state.repo.get_user(who.name)
+    return {"enabled": bool(user and user.get("mfa_enabled")),
+            "required": who.role in request.app.state.settings.mfa_required_roles,
+            "recovery_codes_left": len(user.get("mfa_recovery") or []) if user else 0}
+
+
+@app.post("/v1/auth/mfa/setup")
+def mfa_setup(request: Request, who: Principal = Depends(signed_in_or_enrolling)) -> dict:
+    """Start enrolling an authenticator app. Nothing changes until /enable confirms a code."""
+    st = request.app.state
+    user = st.repo.get_user(who.name)
+    if user.get("mfa_enabled"):
+        raise HTTPException(status_code=409, detail="two-factor sign-in is already on; turn it off first")
+    secret = mfa.new_secret()
+    st.repo.set_mfa_pending(who.name, mfa.SecretBox(st.settings.secret_key).seal(secret))
+    return {"secret": secret, "otpauth_uri": mfa.otpauth_uri(secret, who.name)}
+
+
+@app.post("/v1/auth/mfa/enable")
+def mfa_enable(body: MfaCode, request: Request, who: Principal = Depends(signed_in_or_enrolling)) -> dict:
+    st = request.app.state
+    user = st.repo.get_user(who.name)
+    secret = mfa.SecretBox(st.settings.secret_key).open(user.get("mfa_pending") or "")
+    step = mfa.match_step(secret, body.code, None) if secret else None
+    if step is None:
+        raise HTTPException(status_code=400, detail="that code does not match; check the phone's clock and try again")
+    codes = mfa.new_recovery_codes()
+    st.repo.enable_mfa(who.name, [mfa.recovery_digest(c) for c in codes], step)
+    auth.audit(request, who, "MFA_ENABLED", target=who.name)
+    return {"recovery_codes": codes}
+
+
+@app.post("/v1/auth/mfa/disable", status_code=204)
+def mfa_disable(body: MfaDisable, request: Request, who: Principal = Depends(signed_in)) -> Response:
+    st = request.app.state
+    if who.role in st.settings.mfa_required_roles:
+        raise HTTPException(status_code=403, detail="your role must use two-factor sign-in")
+    user = st.repo.get_user(who.name)
+    secret = mfa.SecretBox(st.settings.secret_key).open(user.get("mfa_secret") or "")
+    if not (auth.verify_password(body.password, user["password_hash"]) and secret
+            and mfa.match_step(secret, body.code, user.get("mfa_last_step")) is not None):
+        auth.audit(request, who, "MFA_DISABLE_FAILED", target=who.name)
+        raise HTTPException(status_code=401, detail="wrong password or code")
+    st.repo.disable_mfa(who.name)
+    auth.audit(request, who, "MFA_DISABLED", target=who.name)
+    return Response(status_code=204)
+
+
+@app.get("/v1/auth/sso")
+def sso_config(request: Request) -> dict:
+    s = request.app.state.settings
+    return {"enabled": s.sso_enabled, "provider_name": s.oidc_provider_name if s.sso_enabled else None}
+
+
+@app.get("/v1/auth/sso/start")
+def sso_start(request: Request) -> Response:
+    if not request.app.state.settings.sso_enabled:
+        raise HTTPException(status_code=404, detail="single sign-on is not configured")
+    return RedirectResponse(sso.start(request), status_code=302)
+
+
+@app.get("/v1/auth/sso/callback")
+def sso_callback(request: Request, code: str | None = None, state: str | None = None,
+                 error: str | None = None, error_description: str | None = None) -> Response:
+    """The provider sends the browser here. The browser always ends up back on the dashboard."""
+    if not request.app.state.settings.sso_enabled:
+        raise HTTPException(status_code=404, detail="single sign-on is not configured")
+    if error or not (code and state):
+        message = error_description or error or "the provider sent no code"
+        return RedirectResponse(sso.back_to_dashboard(request, {"sso_error": message[:200]}), status_code=302)
+    try:
+        session = sso.finish(request, code, state)
+    except HTTPException as exc:
+        return RedirectResponse(sso.back_to_dashboard(request, {"sso_error": str(exc.detail)}), status_code=302)
+    return RedirectResponse(sso.back_to_dashboard(request, {"sso_token": session["token"]}), status_code=302)
+
+
 @app.post("/v1/auth/logout", status_code=204)
-def logout(request: Request, who: Principal = Depends(signed_in),
+def logout(request: Request, who: Principal = Depends(signed_in_or_enrolling),
            authorization: str | None = Header(default=None)) -> Response:
     request.app.state.repo.delete_session(auth.token_digest(authorization[7:].strip()))
     auth.audit(request, who, "LOGOUT")
@@ -153,8 +267,11 @@ def logout(request: Request, who: Principal = Depends(signed_in),
 
 
 @app.get("/v1/auth/me")
-def me(who: Principal = Depends(signed_in)) -> dict:
-    return {"username": who.name, "role": who.role}
+def me(who: Principal = Depends(signed_in_or_enrolling)) -> dict:
+    out = {"username": who.name, "role": who.role}
+    if who.limited:
+        out["mfa_enrolment_required"] = True
+    return out
 
 
 @app.post("/v1/auth/password", status_code=204)
@@ -177,10 +294,12 @@ def create_user(body: NewUser, request: Request, who: Principal = Depends(admin_
     if not re.fullmatch(r"[a-z0-9._-]{3,32}", username):
         raise HTTPException(status_code=422, detail="username: 3 to 32 of a-z, 0-9, dot, dash, underscore")
     auth.check_password_rules(body.password)
-    if not request.app.state.repo.create_user(username, auth.hash_password(body.password), body.role):
-        raise HTTPException(status_code=409, detail="that username already exists")
-    auth.audit(request, who, "USER_CREATE", target=username, detail={"role": body.role})
-    return json_response({"username": username, "role": body.role, "active": True}, 201)
+    email = clean_email(body.email)
+    if not request.app.state.repo.create_user(username, auth.hash_password(body.password), body.role, email):
+        raise HTTPException(status_code=409, detail="that username or e-mail already exists")
+    auth.audit(request, who, "USER_CREATE", target=username, detail={"role": body.role, "email": email})
+    return json_response({"username": username, "role": body.role, "active": True, "email": email,
+                          "mfa_enabled": False, "sso": False}, 201)
 
 
 @app.patch("/v1/users/{username}")
@@ -190,13 +309,15 @@ def change_user(username: str, body: UserChange, request: Request,
         auth.check_password_rules(body.password)
     try:
         row = request.app.state.repo.update_user(
-            username, body.role, body.active, auth.hash_password(body.password) if body.password else None)
+            username, body.role, body.active, auth.hash_password(body.password) if body.password else None,
+            reset_mfa=body.reset_mfa, email=clean_email(body.email))
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
     if row is None:
         raise HTTPException(status_code=404, detail="user not found")
     auth.audit(request, who, "USER_CHANGE", target=username,
-               detail={"role": body.role, "active": body.active, "password_reset": body.password is not None})
+               detail={"role": body.role, "active": body.active, "password_reset": body.password is not None,
+                       "mfa_reset": body.reset_mfa, "email": body.email})
     return json_response(row)
 
 

@@ -54,20 +54,28 @@ class FakeRepo:
     def __init__(self):
         self.policy = Policy()
         self.users, self.sessions, self.audit_rows, self.alert_updates = {}, {}, [], []
+        self.challenges, self.sso_states = {}, {}
 
     def get_user(self, username):
         return self.users.get(username)
 
-    def list_users(self):
-        return [{k: v for k, v in u.items() if k != "password_hash"} for u in self.users.values()]
+    @staticmethod
+    def _public(u):
+        return {"username": u["username"], "role": u["role"], "active": u["active"], "email": u["email"],
+                "mfa_enabled": u["mfa_enabled"], "sso": u["sso_subject"] is not None}
 
-    def create_user(self, username, password_hash, role):
-        if username in self.users:
+    def list_users(self):
+        return [self._public(u) for u in self.users.values()]
+
+    def create_user(self, username, password_hash, role, email=None):
+        if username in self.users or (email and any(u["email"] == email for u in self.users.values())):
             return False
-        self.users[username] = {"username": username, "password_hash": password_hash, "role": role, "active": True}
+        self.users[username] = {"username": username, "password_hash": password_hash, "role": role, "active": True,
+                                "email": email, "sso_subject": None, "mfa_enabled": False, "mfa_secret": None,
+                                "mfa_pending": None, "mfa_last_step": None, "mfa_recovery": []}
         return True
 
-    def update_user(self, username, role, active, password_hash):
+    def update_user(self, username, role, active, password_hash, reset_mfa=False, email=None):
         u = self.users.get(username)
         if u is None:
             return None
@@ -77,21 +85,82 @@ class FakeRepo:
         if loses_admin and not others:
             raise ValueError("this is the last active administrator")
         changed_role = role is not None and role != u["role"]
-        u.update({k: v for k, v in (("role", role), ("active", active), ("password_hash", password_hash))
-                  if v is not None})
-        if active is False or password_hash is not None or changed_role:
-            self.sessions = {t: n for t, n in self.sessions.items() if n != username}
-        return {k: v for k, v in u.items() if k != "password_hash"}
+        u.update({k: v for k, v in (("role", role), ("active", active), ("password_hash", password_hash),
+                                    ("email", email)) if v is not None})
+        if reset_mfa:
+            u.update(mfa_enabled=False, mfa_secret=None, mfa_recovery=[])
+        if active is False or password_hash is not None or changed_role or reset_mfa:
+            self.sessions = {t: v for t, v in self.sessions.items() if v[0] != username}
+        return self._public(u)
 
-    def create_session(self, token_sha256, username, expires_at):
-        self.sessions[token_sha256] = username
+    def create_session(self, token_sha256, username, expires_at, limited=False, method="password"):
+        self.sessions[token_sha256] = (username, limited)
 
     def get_session_user(self, token_sha256):
-        u = self.users.get(self.sessions.get(token_sha256))
-        return {"username": u["username"], "role": u["role"]} if u and u["active"] else None
+        name, limited = self.sessions.get(token_sha256, (None, False))
+        u = self.users.get(name)
+        return {"username": u["username"], "role": u["role"], "limited": limited} if u and u["active"] else None
 
     def delete_session(self, token_sha256):
         self.sessions.pop(token_sha256, None)
+
+    def create_challenge(self, token_sha256, username, expires_at):
+        self.challenges[token_sha256] = {"username": username, "attempts": 0}
+
+    def use_challenge(self, token_sha256, max_attempts):
+        c = self.challenges.get(token_sha256)
+        if c is None or c["attempts"] >= max_attempts:
+            return None
+        c["attempts"] += 1
+        return dict(c)
+
+    def delete_challenge(self, token_sha256):
+        self.challenges.pop(token_sha256, None)
+
+    def set_mfa_last_step(self, username, step):
+        u = self.users[username]
+        if u["mfa_last_step"] is not None and u["mfa_last_step"] >= step:
+            return False
+        u["mfa_last_step"] = step
+        return True
+
+    def use_recovery_code(self, username, digest):
+        u = self.users[username]
+        if u["mfa_enabled"] and digest in u["mfa_recovery"]:
+            u["mfa_recovery"].remove(digest)
+            return True
+        return False
+
+    def set_mfa_pending(self, username, sealed):
+        self.users[username]["mfa_pending"] = sealed
+
+    def enable_mfa(self, username, digests, step):
+        u = self.users[username]
+        u.update(mfa_secret=u["mfa_pending"], mfa_pending=None, mfa_enabled=True, mfa_recovery=list(digests),
+                 mfa_last_step=step)
+        self.sessions = {t: (n, False if n == username else lim) for t, (n, lim) in self.sessions.items()}
+
+    def disable_mfa(self, username):
+        self.users[username].update(mfa_enabled=False, mfa_secret=None, mfa_pending=None, mfa_recovery=[])
+
+    def find_user_for_sso(self, subject, email):
+        for u in self.users.values():
+            if u["sso_subject"] == subject:
+                return u
+        for u in self.users.values():
+            if email and u["email"] == email:
+                return u
+        return None
+
+    def link_sso_subject(self, username, subject):
+        if self.users[username]["sso_subject"] is None:
+            self.users[username]["sso_subject"] = subject
+
+    def save_sso_state(self, state_sha256, nonce, verifier, expires_at):
+        self.sso_states[state_sha256] = {"nonce": nonce, "code_verifier": verifier}
+
+    def pop_sso_state(self, state_sha256):
+        return self.sso_states.pop(state_sha256, None)
 
     def audit(self, actor, role, action, target, detail, ip):
         self.audit_rows.append({"actor": actor, "role": role, "action": action, "target": target, "detail": detail})
@@ -125,6 +194,7 @@ def make_client(monkeypatch, tmp_path, environment="demo", rate="1000"):
     monkeypatch.setenv("ADMIN_PASSWORD", PASSWORD)
     monkeypatch.setenv("ENVIRONMENT", environment)
     monkeypatch.setenv("RATE_LIMIT_PER_MINUTE", rate)
+    monkeypatch.setenv("SECRET_KEY", "unit-test-secret-key-that-is-long-enough")
     r = fakeredis.FakeRedis()
     st = app.state
     st.redis, st.store, st.scorer, st.repo = r, RedisFeatureStore(r), Scorer(tmp_path), FakeRepo()
@@ -278,6 +348,9 @@ def test_production_refuses_demo_credentials(monkeypatch):
     with pytest.raises(RuntimeError, match="ADMIN_PASSWORD"):
         get_settings().assert_safe_for_production()  # the demo administrator password alone is enough to refuse
     monkeypatch.setenv("ADMIN_PASSWORD", "a-real-admin-password")
+    with pytest.raises(RuntimeError, match="SECRET_KEY"):
+        get_settings().assert_safe_for_production()  # the demo key would let anyone decrypt 2FA secrets
+    monkeypatch.setenv("SECRET_KEY", "x" * 40)
     get_settings().assert_safe_for_production()
 
 

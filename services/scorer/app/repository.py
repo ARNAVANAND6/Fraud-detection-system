@@ -57,16 +57,20 @@ class Repository:
     def list_users(self) -> list[dict]:
         with self.pool.connection() as c:
             return c.execute(
-                "SELECT username, role, active, created_at, updated_at FROM users ORDER BY username").fetchall()
+                """SELECT username, role, active, email, mfa_enabled, sso_subject IS NOT NULL AS sso,
+                          created_at, updated_at FROM users ORDER BY username""").fetchall()
 
-    def create_user(self, username: str, password_hash: str, role: str) -> bool:
+    def create_user(self, username: str, password_hash: str, role: str, email: str | None = None) -> bool:
         with self.pool.connection() as c:
-            cur = c.execute("INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s) "
-                            "ON CONFLICT (username) DO NOTHING", (username, password_hash, role))
+            try:
+                cur = c.execute("INSERT INTO users (username, password_hash, role, email) VALUES (%s, %s, %s, %s) "
+                                "ON CONFLICT (username) DO NOTHING", (username, password_hash, role, email))
+            except psycopg.errors.UniqueViolation:
+                return False   # e-mail already used by another account
             return cur.rowcount == 1
 
     def update_user(self, username: str, role: str | None, active: bool | None,
-                    password_hash: str | None) -> dict | None:
+                    password_hash: str | None, reset_mfa: bool = False, email: str | None = None) -> dict | None:
         """Change a user. Refuses to leave the system without an active admin."""
         with self.pool.connection() as c, c.transaction():
             cur = c.execute("SELECT * FROM users WHERE username = %s FOR UPDATE", (username,)).fetchone()
@@ -81,22 +85,105 @@ class Repository:
                     raise ValueError("this is the last active administrator")
             row = c.execute(
                 """UPDATE users SET role = coalesce(%s, role), active = coalesce(%s, active),
-                       password_hash = coalesce(%s, password_hash), updated_at = now()
-                   WHERE username = %s RETURNING username, role, active, created_at, updated_at""",
-                (role, active, password_hash, username)).fetchone()
-            if active is False or password_hash is not None or (role is not None and role != cur["role"]):
+                       password_hash = coalesce(%s, password_hash), email = coalesce(%s, email),
+                       mfa_enabled = mfa_enabled AND NOT %s,
+                       mfa_secret = CASE WHEN %s THEN NULL ELSE mfa_secret END,
+                       mfa_recovery = CASE WHEN %s THEN '{}' ELSE mfa_recovery END,
+                       updated_at = now()
+                   WHERE username = %s
+                   RETURNING username, role, active, email, mfa_enabled, sso_subject IS NOT NULL AS sso,
+                             created_at, updated_at""",
+                (role, active, password_hash, email, reset_mfa, reset_mfa, reset_mfa, username)).fetchone()
+            if (active is False or password_hash is not None or reset_mfa
+                    or (role is not None and role != cur["role"])):
                 c.execute("DELETE FROM sessions WHERE username = %s", (username,))  # sign them out everywhere
             return row
 
-    def create_session(self, token_sha256: str, username: str, expires_at: datetime) -> None:
+    def create_session(self, token_sha256: str, username: str, expires_at: datetime,
+                       limited: bool = False, method: str = "password") -> None:
         with self.pool.connection() as c:
-            c.execute("INSERT INTO sessions (token_sha256, username, expires_at) VALUES (%s, %s, %s)",
+            c.execute("INSERT INTO sessions (token_sha256, username, expires_at, limited, method) "
+                      "VALUES (%s, %s, %s, %s, %s)", (token_sha256, username, expires_at, limited, method))
+
+    # ---- two-factor sign-in ----
+    def create_challenge(self, token_sha256: str, username: str, expires_at: datetime) -> None:
+        with self.pool.connection() as c:
+            c.execute("DELETE FROM login_challenges WHERE expires_at < now()")
+            c.execute("INSERT INTO login_challenges (token_sha256, username, expires_at) VALUES (%s, %s, %s)",
                       (token_sha256, username, expires_at))
+
+    def use_challenge(self, token_sha256: str, max_attempts: int) -> dict | None:
+        """Count one attempt against a pending sign-in; None if it is unknown, expired or used up."""
+        with self.pool.connection() as c:
+            return c.execute(
+                """UPDATE login_challenges SET attempts = attempts + 1
+                   WHERE token_sha256 = %s AND expires_at > now() AND attempts < %s
+                   RETURNING username, attempts""", (token_sha256, max_attempts)).fetchone()
+
+    def delete_challenge(self, token_sha256: str) -> None:
+        with self.pool.connection() as c:
+            c.execute("DELETE FROM login_challenges WHERE token_sha256 = %s", (token_sha256,))
+
+    def set_mfa_last_step(self, username: str, step: int) -> bool:
+        """Record a used code's time step. False if that step (or a later one) was already used."""
+        with self.pool.connection() as c:
+            return c.execute(
+                """UPDATE users SET mfa_last_step = %s
+                   WHERE username = %s AND (mfa_last_step IS NULL OR mfa_last_step < %s)""",
+                (step, username, step)).rowcount == 1
+
+    def use_recovery_code(self, username: str, digest: str) -> bool:
+        with self.pool.connection() as c:
+            return c.execute(
+                """UPDATE users SET mfa_recovery = array_remove(mfa_recovery, %s)
+                   WHERE username = %s AND mfa_enabled AND %s = ANY (mfa_recovery)""",
+                (digest, username, digest)).rowcount == 1
+
+    def set_mfa_pending(self, username: str, sealed_secret: str) -> None:
+        with self.pool.connection() as c:
+            c.execute("UPDATE users SET mfa_pending = %s WHERE username = %s", (sealed_secret, username))
+
+    def enable_mfa(self, username: str, recovery_digests: list[str], step: int) -> None:
+        """Make the pending secret the active one. Other sessions end: they were not made with it."""
+        with self.pool.connection() as c, c.transaction():
+            c.execute("""UPDATE users SET mfa_secret = mfa_pending, mfa_pending = NULL, mfa_enabled = TRUE,
+                             mfa_recovery = %s, mfa_last_step = %s, updated_at = now()
+                         WHERE username = %s""", (recovery_digests, step, username))
+            c.execute("UPDATE sessions SET limited = FALSE WHERE username = %s", (username,))
+
+    def disable_mfa(self, username: str) -> None:
+        with self.pool.connection() as c:
+            c.execute("""UPDATE users SET mfa_enabled = FALSE, mfa_secret = NULL, mfa_pending = NULL,
+                             mfa_recovery = '{}', updated_at = now() WHERE username = %s""", (username,))
+
+    # ---- single sign-on ----
+    def find_user_for_sso(self, subject: str, email: str | None) -> dict | None:
+        with self.pool.connection() as c:
+            row = c.execute("SELECT * FROM users WHERE sso_subject = %s", (subject,)).fetchone()
+            if row is None and email:
+                row = c.execute("SELECT * FROM users WHERE lower(email) = lower(%s)", (email,)).fetchone()
+            return row
+
+    def link_sso_subject(self, username: str, subject: str) -> None:
+        with self.pool.connection() as c:
+            c.execute("UPDATE users SET sso_subject = %s WHERE username = %s AND sso_subject IS NULL",
+                      (subject, username))
+
+    def save_sso_state(self, state_sha256: str, nonce: str, code_verifier: str, expires_at: datetime) -> None:
+        with self.pool.connection() as c:
+            c.execute("DELETE FROM sso_states WHERE expires_at < now()")
+            c.execute("INSERT INTO sso_states (state_sha256, nonce, code_verifier, expires_at) VALUES (%s,%s,%s,%s)",
+                      (state_sha256, nonce, code_verifier, expires_at))
+
+    def pop_sso_state(self, state_sha256: str) -> dict | None:
+        with self.pool.connection() as c:
+            return c.execute("DELETE FROM sso_states WHERE state_sha256 = %s AND expires_at > now() "
+                             "RETURNING nonce, code_verifier", (state_sha256,)).fetchone()
 
     def get_session_user(self, token_sha256: str) -> dict | None:
         with self.pool.connection() as c:
             return c.execute(
-                """SELECT u.username, u.role FROM sessions s JOIN users u USING (username)
+                """SELECT u.username, u.role, s.limited FROM sessions s JOIN users u USING (username)
                    WHERE s.token_sha256 = %s AND s.expires_at > now() AND u.active""", (token_sha256,)).fetchone()
 
     def delete_session(self, token_sha256: str) -> None:
