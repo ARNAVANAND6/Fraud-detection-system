@@ -1,19 +1,37 @@
-// REST client for the VYROX API. The API key here is a development key only:
-// anything shipped to a browser is public. Production would use analyst
-// sign-in (OIDC) and short-lived tokens instead.
+// REST client for the VYROX API. People sign in and the browser holds a session
+// token for the tab's lifetime (sessionStorage). No API key is shipped to the browser.
 export const BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
-export const KEY = import.meta.env.VITE_API_KEY ?? "dev-key";
+
+export type Role = "VIEWER" | "ANALYST" | "ADMIN";
+export interface Me { username: string; role: Role }
+
+const TOKEN_KEY = "vyrox-session";
+let token: string | null = null;
+try { token = sessionStorage.getItem(TOKEN_KEY); } catch { /* storage blocked: stay signed out */ }
+const expiryListeners = new Set<() => void>();
+export const session = {
+  has: () => token !== null,
+  set(t: string | null) {
+    token = t;
+    try { if (t) sessionStorage.setItem(TOKEN_KEY, t); else sessionStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ }
+  },
+  /** Called when the server says the session is no longer valid. */
+  expired() { session.set(null); expiryListeners.forEach((f) => f()); },
+  onExpired(f: () => void) { expiryListeners.add(f); return () => { expiryListeners.delete(f); }; },
+};
+export const authHeaders = (): Record<string, string> => (token ? { Authorization: `Bearer ${token}` } : {});
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
-  const headers: Record<string, string> = { "X-API-Key": KEY, ...((init?.headers as Record<string, string>) ?? {}) };
+  const headers: Record<string, string> = { ...authHeaders(), ...((init?.headers as Record<string, string>) ?? {}) };
   if (typeof init?.body === "string") headers["Content-Type"] = "application/json";
   const res = await fetch(`${BASE}${path}`, { ...init, headers });
+  if (res.status === 401 && path !== "/v1/auth/login") session.expired();
   if (!res.ok) {
     let detail = await res.text();
-    try { detail = JSON.stringify(JSON.parse(detail).detail); } catch { /* keep text */ }
+    try { const d = JSON.parse(detail).detail; detail = typeof d === "string" ? d : JSON.stringify(d); } catch { /* keep text */ }
     throw new Error(`${res.status}: ${detail}`);
   }
-  return res.json() as Promise<T>;
+  return (res.status === 204 ? undefined : res.json()) as Promise<T>;
 }
 
 export type Source = "LIVE_API" | "LIVE_WEBHOOK" | "KAFKA_STREAM" | "HISTORICAL_IMPORT" | "SIMULATED_DEMO";
@@ -71,6 +89,11 @@ export interface Status {
   spark_backlog: number | null; last_event_at: string | null; last_inference_at: string | null;
   seconds_since_last_event: number | null; active_sources: Source[]; dashboard_clients: number;
 }
+export interface User { username: string; role: Role; active: boolean; created_at?: string; updated_at?: string }
+export interface AuditRow {
+  id: number; at: string; actor: string; role: string; action: string; target: string | null;
+  detail: Record<string, unknown>; ip: string | null;
+}
 export interface Policy {
   thresholds: { medium: number; high: number; critical: number };
   alerts: { score_alert_level: RiskLevel; rule_triggers: string[]; rule_min_level: RiskLevel; dedup_minutes: number;
@@ -79,13 +102,26 @@ export interface Policy {
 
 const q = (source: Source | null) => (source ? `source=${source}` : "");
 export const api = {
+  login: async (username: string, password: string) => {
+    const r = await call<Me & { token: string }>("/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
+    session.set(r.token);
+    return { username: r.username, role: r.role } as Me;
+  },
+  logout: async () => { try { await call<void>("/v1/auth/logout", { method: "POST" }); } finally { session.set(null); } },
+  me: () => call<Me>("/v1/auth/me"),
+  users: () => call<User[]>("/v1/users"),
+  createUser: (username: string, password: string, role: Role) =>
+    call<User>("/v1/users", { method: "POST", body: JSON.stringify({ username, password, role }) }),
+  changeUser: (username: string, body: { role?: Role; active?: boolean; password?: string }) =>
+    call<User>(`/v1/users/${encodeURIComponent(username)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  audit: () => call<AuditRow[]>("/v1/audit?limit=200"),
   stats: (source: Source | null) => call<Stats>(`/v1/stats?${q(source)}`),
   recent: (limit: number, source: Source | null) => call<Txn[]>(`/v1/transactions/recent?limit=${limit}&${q(source)}`),
   transaction: (id: string) => call<TxnDetail>(`/v1/transactions/${encodeURIComponent(id)}`),
   alerts: () => call<Alert[]>("/v1/alerts?limit=200"),
   alert: (id: number) => call<AlertDetail>(`/v1/alerts/${id}`),
   updateAlert: (id: number, body: { status?: AlertStatus; assigned_to?: string }) =>
-    call<Alert>(`/v1/alerts/${id}`, { method: "PATCH", body: JSON.stringify({ ...body, actor: "dashboard-user" }) }),
+    call<Alert>(`/v1/alerts/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   config: () => call<Policy>("/v1/config"),
   saveConfig: (p: Policy) => call<Policy>("/v1/config", { method: "PUT", body: JSON.stringify(p) }),
   scenario: (scenario: string) =>

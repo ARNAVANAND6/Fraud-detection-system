@@ -7,7 +7,7 @@
 // fetch() is used instead of EventSource so the API key can travel in a
 // header rather than in the URL.
 import { useEffect, useRef, useState } from "react";
-import { Alert, BASE, KEY, Stats, Status, Txn } from "./api";
+import { Alert, authHeaders, BASE, session, Stats, Status, Txn } from "./api";
 
 export type Conn = "connecting" | "connected" | "disconnected";
 const FEED_SIZE = 1200; // per source; enough for the 3D view's 20-second window at about 50 events per second
@@ -106,7 +106,8 @@ export function useLive(seedFeed: () => Promise<Txn[]>): Live {
       while (!stopped) {
         controller = new AbortController();
         try {
-          const res = await fetch(`${BASE}/v1/stream`, { headers: { "X-API-Key": KEY }, signal: controller.signal });
+          const res = await fetch(`${BASE}/v1/stream`, { headers: authHeaders(), signal: controller.signal });
+          if (res.status === 401) { session.expired(); return; }  // signed out: stop retrying
           if (!res.ok || !res.body) throw new Error(`stream ${res.status}`);
           lastByte = Date.now();
           // Stored history first, so the feed never starts from invented rows.

@@ -39,6 +39,79 @@ class Repository:
         with self.pool.connection() as c:
             return c.execute("SELECT 1 AS ok").fetchone()["ok"] == 1
 
+    # ---- users, sessions, audit ------------------------------------------------
+    def ensure_auth(self, admin_username: str, admin_password_hash: str) -> None:
+        """Create the auth tables if missing (older databases predate them) and the first admin."""
+        from .auth import AUTH_SCHEMA
+
+        with self.pool.connection() as c:
+            c.execute(AUTH_SCHEMA)
+            c.execute("INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'ADMIN') "
+                      "ON CONFLICT (username) DO NOTHING", (admin_username, admin_password_hash))
+            c.execute("DELETE FROM sessions WHERE expires_at < now()")
+
+    def get_user(self, username: str) -> dict | None:
+        with self.pool.connection() as c:
+            return c.execute("SELECT * FROM users WHERE username = %s", (username,)).fetchone()
+
+    def list_users(self) -> list[dict]:
+        with self.pool.connection() as c:
+            return c.execute(
+                "SELECT username, role, active, created_at, updated_at FROM users ORDER BY username").fetchall()
+
+    def create_user(self, username: str, password_hash: str, role: str) -> bool:
+        with self.pool.connection() as c:
+            cur = c.execute("INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s) "
+                            "ON CONFLICT (username) DO NOTHING", (username, password_hash, role))
+            return cur.rowcount == 1
+
+    def update_user(self, username: str, role: str | None, active: bool | None,
+                    password_hash: str | None) -> dict | None:
+        """Change a user. Refuses to leave the system without an active admin."""
+        with self.pool.connection() as c, c.transaction():
+            cur = c.execute("SELECT * FROM users WHERE username = %s FOR UPDATE", (username,)).fetchone()
+            if cur is None:
+                return None
+            loses_admin = cur["role"] == "ADMIN" and cur["active"] and (
+                (role is not None and role != "ADMIN") or active is False)
+            if loses_admin:
+                others = c.execute("SELECT count(*) AS n FROM users WHERE role = 'ADMIN' AND active AND username <> %s",
+                                   (username,)).fetchone()["n"]
+                if others == 0:
+                    raise ValueError("this is the last active administrator")
+            row = c.execute(
+                """UPDATE users SET role = coalesce(%s, role), active = coalesce(%s, active),
+                       password_hash = coalesce(%s, password_hash), updated_at = now()
+                   WHERE username = %s RETURNING username, role, active, created_at, updated_at""",
+                (role, active, password_hash, username)).fetchone()
+            if active is False or password_hash is not None or (role is not None and role != cur["role"]):
+                c.execute("DELETE FROM sessions WHERE username = %s", (username,))  # sign them out everywhere
+            return row
+
+    def create_session(self, token_sha256: str, username: str, expires_at: datetime) -> None:
+        with self.pool.connection() as c:
+            c.execute("INSERT INTO sessions (token_sha256, username, expires_at) VALUES (%s, %s, %s)",
+                      (token_sha256, username, expires_at))
+
+    def get_session_user(self, token_sha256: str) -> dict | None:
+        with self.pool.connection() as c:
+            return c.execute(
+                """SELECT u.username, u.role FROM sessions s JOIN users u USING (username)
+                   WHERE s.token_sha256 = %s AND s.expires_at > now() AND u.active""", (token_sha256,)).fetchone()
+
+    def delete_session(self, token_sha256: str) -> None:
+        with self.pool.connection() as c:
+            c.execute("DELETE FROM sessions WHERE token_sha256 = %s", (token_sha256,))
+
+    def audit(self, actor: str, role: str, action: str, target: str | None, detail: dict, ip: str | None) -> None:
+        with self.pool.connection() as c:
+            c.execute("INSERT INTO audit_log (actor, role, action, target, detail, ip) VALUES (%s,%s,%s,%s,%s,%s)",
+                      (actor, role, action, target, Jsonb(detail), ip))
+
+    def list_audit(self, limit: int) -> list[dict]:
+        with self.pool.connection() as c:
+            return c.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT %s", (limit,)).fetchall()
+
     # ---- policy ---------------------------------------------------------------
     def get_policy(self) -> Policy:
         with self.pool.connection() as c:

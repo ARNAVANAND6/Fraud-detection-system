@@ -1,11 +1,13 @@
 // Browser-level check of acceptance tests 1, 6, 7 and 8: what a person actually sees.
 //   node tests/acceptance/browser_check.js <screenshot-dir>
-// Env: DASHBOARD_URL, API_URL, API_KEY, SCORER_STOP_CMD, SCORER_START_CMD, API_STOP_CMD, API_START_CMD
+// Env: DASHBOARD_URL, API_URL, API_KEY, DASH_USER, DASH_PASSWORD, SCORER_STOP_CMD, SCORER_START_CMD, API_STOP_CMD, API_START_CMD
 const { chromium } = require("playwright");
 const { execSync, spawn } = require("child_process");
 const DASH = process.env.DASHBOARD_URL || "http://localhost:3000";
 const API = process.env.API_URL || "http://localhost:8000";
 const KEY = process.env.API_KEY || "dev-key";
+const USER = process.env.DASH_USER || "admin";
+const PASSWORD = process.env.DASH_PASSWORD || "vyrox-demo-admin";
 const STOP = process.env.SCORER_STOP_CMD || "docker compose stop scorer";
 const START = process.env.SCORER_START_CMD || "docker compose start scorer";
 const API_STOP = process.env.API_STOP_CMD || "docker compose stop api";
@@ -27,8 +29,20 @@ async function send(id) {
   let navigations = 0;
   page.on("framenavigated", (f) => { if (f === page.mainFrame()) navigations += 1; });
   await page.goto(DASH);
+  // Nothing is shown before sign-in, and a wrong password is refused.
+  const signin = page.getByTestId("signin");
+  await signin.waitFor({ timeout: 15000 });
+  check("sign-in is required before any data is shown", (await page.getByTestId("statusbar").count()) === 0);
+  await signin.locator("input").nth(0).fill(USER);
+  await signin.locator("input").nth(1).fill("not-the-password");
+  await signin.locator("button[type=submit]").click();
+  await signin.locator("[role=alert]").waitFor({ timeout: 10000 });
+  check("wrong password is refused", (await page.getByTestId("statusbar").count()) === 0, await signin.locator("[role=alert]").innerText());
+  await signin.locator("input").nth(1).fill(PASSWORD);
+  await signin.locator("button[type=submit]").click();
   const pill = page.getByTestId("stream-pill");
   await pill.filter({ hasText: /LIVE|IDLE/ }).waitFor({ timeout: 20000 });
+  check("signed-in user and role are shown", (await page.getByTestId("who").innerText()).includes(USER));
   check("environment badge is shown", await page.locator(".env").innerText().then((t) => /DEMO|PRODUCTION/.test(t)));
 
   const processed0 = await page.getByTestId("kpi-processed").innerText();

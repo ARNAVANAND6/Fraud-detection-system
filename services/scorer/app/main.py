@@ -13,6 +13,7 @@ import asyncio
 import io
 import json
 import random
+import re
 import time
 import uuid
 from collections import defaultdict, deque
@@ -33,6 +34,8 @@ from fraudlib.scoring import Scorer
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ValidationError
 
+from . import auth
+from .auth import Principal, admin_only, can_ingest, can_read, can_work_alerts, signed_in
 from .gateway import Gateway, PublishError, verify_webhook
 from .metrics import API_LATENCY
 
@@ -66,6 +69,7 @@ async def lifespan(app: FastAPI):
     st = app.state
     st.settings = s
     st.limiter = RateLimiter(s.rate_limit_per_minute)
+    st.login_throttle = auth.LoginThrottle()
     injected = hasattr(st, "repo")  # unit tests inject fakes and skip Kafka
     if not injected:
         from .live import LiveState
@@ -77,6 +81,7 @@ async def lifespan(app: FastAPI):
         st.scorer = Scorer(s.model_dir)
         st.repo = connect_with_retry(s.database_url)
         st.repo.ensure_policy()
+        st.repo.ensure_auth(s.admin_username, auth.hash_password(s.admin_password))
         st.gateway = Gateway(s, st.redis)
         st.live = LiveState(s, st.repo, st.redis, st.gateway)
         await st.live.start()
@@ -103,15 +108,6 @@ async def timing(request: Request, call_next):
     return response
 
 
-def require_key(request: Request, x_api_key: str | None = Header(default=None)) -> str:
-    s: Settings = request.app.state.settings
-    if x_api_key is None or x_api_key not in s.api_keys:
-        raise HTTPException(status_code=401, detail="missing or invalid X-API-Key")
-    if not request.app.state.limiter.allow(x_api_key):
-        raise HTTPException(status_code=429, detail="rate limit exceeded")
-    return x_api_key
-
-
 def json_response(obj, status_code: int = 200) -> Response:
     return Response(jsonlog.dumps(obj), status_code=status_code, media_type="application/json")
 
@@ -123,6 +119,91 @@ def do_ingest(request: Request, events: list[TransactionEvent], source: Source) 
         raise HTTPException(status_code=403, detail=str(exc)) from None
     except (PublishError, redis.RedisError) as exc:
         raise HTTPException(status_code=503, detail=f"ingestion unavailable: {exc}") from None
+
+
+# ---- sign-in, users, audit ---------------------------------------------------------
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class NewUser(BaseModel):
+    username: str
+    password: str
+    role: Literal["VIEWER", "ANALYST", "ADMIN"]
+
+
+class UserChange(BaseModel):
+    role: Literal["VIEWER", "ANALYST", "ADMIN"] | None = None
+    active: bool | None = None
+    password: str | None = None
+
+
+@app.post("/v1/auth/login")
+def login(body: LoginRequest, request: Request) -> Response:
+    return json_response(auth.login(request, body.username, body.password))
+
+
+@app.post("/v1/auth/logout", status_code=204)
+def logout(request: Request, who: Principal = Depends(signed_in),
+           authorization: str | None = Header(default=None)) -> Response:
+    request.app.state.repo.delete_session(auth.token_digest(authorization[7:].strip()))
+    auth.audit(request, who, "LOGOUT")
+    return Response(status_code=204)
+
+
+@app.get("/v1/auth/me")
+def me(who: Principal = Depends(signed_in)) -> dict:
+    return {"username": who.name, "role": who.role}
+
+
+@app.post("/v1/auth/password", status_code=204)
+def change_own_password(body: LoginRequest, request: Request, who: Principal = Depends(signed_in)) -> Response:
+    """Change your own password. `username` is ignored; `password` is the new one. Signs out every session."""
+    auth.check_password_rules(body.password)
+    request.app.state.repo.update_user(who.name, None, None, auth.hash_password(body.password))
+    auth.audit(request, who, "PASSWORD_CHANGE", target=who.name)
+    return Response(status_code=204)
+
+
+@app.get("/v1/users")
+def list_users(request: Request, _: Principal = Depends(admin_only)) -> Response:
+    return json_response(request.app.state.repo.list_users())
+
+
+@app.post("/v1/users", status_code=201)
+def create_user(body: NewUser, request: Request, who: Principal = Depends(admin_only)) -> Response:
+    username = body.username.strip().lower()
+    if not re.fullmatch(r"[a-z0-9._-]{3,32}", username):
+        raise HTTPException(status_code=422, detail="username: 3 to 32 of a-z, 0-9, dot, dash, underscore")
+    auth.check_password_rules(body.password)
+    if not request.app.state.repo.create_user(username, auth.hash_password(body.password), body.role):
+        raise HTTPException(status_code=409, detail="that username already exists")
+    auth.audit(request, who, "USER_CREATE", target=username, detail={"role": body.role})
+    return json_response({"username": username, "role": body.role, "active": True}, 201)
+
+
+@app.patch("/v1/users/{username}")
+def change_user(username: str, body: UserChange, request: Request,
+                who: Principal = Depends(admin_only)) -> Response:
+    if body.password is not None:
+        auth.check_password_rules(body.password)
+    try:
+        row = request.app.state.repo.update_user(
+            username, body.role, body.active, auth.hash_password(body.password) if body.password else None)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    if row is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    auth.audit(request, who, "USER_CHANGE", target=username,
+               detail={"role": body.role, "active": body.active, "password_reset": body.password is not None})
+    return json_response(row)
+
+
+@app.get("/v1/audit")
+def audit_log(request: Request, limit: int = Query(200, le=1000),
+              _: Principal = Depends(admin_only)) -> Response:
+    return json_response(request.app.state.repo.list_audit(limit))
 
 
 # ---- health and metrics ----------------------------------------------------------
@@ -161,7 +242,7 @@ def metrics() -> Response:
 
 # ---- ingestion ---------------------------------------------------------------------
 @app.post("/v1/transactions", status_code=202)
-def ingest_transaction(event: TransactionEvent, request: Request, _: str = Depends(require_key)) -> dict:
+def ingest_transaction(event: TransactionEvent, request: Request, who: Principal = Depends(can_ingest)) -> dict:
     """Authenticated REST ingestion. Safe to retry: the same transaction_id is accepted once."""
     result = do_ingest(request, [event], Source.LIVE_API)
     return {"transaction_id": event.transaction_id, "source": Source.LIVE_API.value,
@@ -194,7 +275,7 @@ async def webhook(request: Request, x_vyrox_timestamp: str | None = Header(defau
 
 
 @app.post("/v1/imports", status_code=202)
-def import_file(file: UploadFile, request: Request, _: str = Depends(require_key)) -> dict:
+def import_file(file: UploadFile, request: Request, who: Principal = Depends(admin_only)) -> dict:
     """Historical CSV or Parquet upload. Columns must match the transaction schema.
     Rows are scored by the same pipeline and labelled HISTORICAL_IMPORT."""
     import pandas as pd
@@ -231,6 +312,8 @@ def import_file(file: UploadFile, request: Request, _: str = Depends(require_key
                 errors.append({"row": i + 1, "field": ".".join(map(str, first["loc"])), "error": first["msg"]})
     invalid = len(df) - len(events)
     result = do_ingest(request, events, Source.HISTORICAL_IMPORT) if events else {"accepted": [], "duplicates": []}
+    auth.audit(request, who, "IMPORT", target=file.filename,
+               detail={"rows": len(df), "accepted": len(result["accepted"])})
     return {"file": file.filename, "source": Source.HISTORICAL_IMPORT.value, "rows": len(df),
             "accepted": len(result["accepted"]), "duplicates": len(result["duplicates"]),
             "invalid": invalid, "first_errors": errors}
@@ -241,7 +324,7 @@ class ScenarioRequest(BaseModel):
 
 
 @app.post("/v1/demo/scenario", status_code=202)
-def demo_scenario(body: ScenarioRequest, request: Request, _: str = Depends(require_key)) -> dict:
+def demo_scenario(body: ScenarioRequest, request: Request, who: Principal = Depends(admin_only)) -> dict:
     """Inject a controlled fraud scenario. Exists only in the demo environment."""
     if request.app.state.settings.environment != "demo":
         raise HTTPException(status_code=404, detail="not available outside the demo environment")
@@ -258,12 +341,13 @@ def demo_scenario(body: ScenarioRequest, request: Request, _: str = Depends(requ
     events = [TransactionEvent(transaction_id=f"TXN_SCN_{tag}_{i}", event_time=t, amount=amt,
                                old_balance_orig=bal, **base) for i, (t, amt, bal) in enumerate(specs)]
     result = do_ingest(request, events, Source.SIMULATED_DEMO)
+    auth.audit(request, who, "DEMO_SCENARIO", target=body.scenario, detail={"account_id": acct})
     return {"scenario": body.scenario, "source": Source.SIMULATED_DEMO.value, "account_id": acct,
             "transaction_ids": result["accepted"]}
 
 
 @app.post("/v1/score", response_model=RiskScore)
-def score(event: TransactionEvent, request: Request, _: str = Depends(require_key)) -> RiskScore:
+def score(event: TransactionEvent, request: Request, who: Principal = Depends(can_ingest)) -> RiskScore:
     """Dry run: scores with current features without storing anything or changing feature state."""
     st = request.app.state
     try:
@@ -276,7 +360,7 @@ def score(event: TransactionEvent, request: Request, _: str = Depends(require_ke
 
 # ---- live stream -------------------------------------------------------------------
 @app.get("/v1/stream")
-async def stream(request: Request, _: str = Depends(require_key)) -> StreamingResponse:
+async def stream(request: Request, _: Principal = Depends(can_read)) -> StreamingResponse:
     live_state = request.app.state.live
     hub = live_state.hub
     q = hub.subscribe()
@@ -301,32 +385,32 @@ async def stream(request: Request, _: str = Depends(require_key)) -> StreamingRe
 
 
 @app.get("/v1/status")
-def status(request: Request, _: str = Depends(require_key)) -> Response:
+def status(request: Request, _: Principal = Depends(can_read)) -> Response:
     return json_response(request.app.state.live.status())
 
 
 @app.get("/v1/stats")
-def stats(request: Request, source: Source | None = None, _: str = Depends(require_key)) -> Response:
+def stats(request: Request, source: Source | None = None, _: Principal = Depends(can_read)) -> Response:
     out = request.app.state.repo.stats(source.value if source else None)
     out["performance"] = request.app.state.live.performance()
     return json_response(out)
 
 
 @app.get("/v1/performance")
-def performance(request: Request, _: str = Depends(require_key)) -> Response:
+def performance(request: Request, _: Principal = Depends(can_read)) -> Response:
     return json_response(request.app.state.live.performance())
 
 
 # ---- investigation -------------------------------------------------------------------
 @app.get("/v1/transactions/recent")
 def recent(request: Request, limit: int = Query(50, le=500), suspicious: bool = False,
-           source: Source | None = None, _: str = Depends(require_key)) -> Response:
+           source: Source | None = None, _: Principal = Depends(can_read)) -> Response:
     return json_response(request.app.state.repo.recent_transactions(
         limit, suspicious, source.value if source else None))
 
 
 @app.get("/v1/transactions/{transaction_id}")
-def transaction(transaction_id: str, request: Request, _: str = Depends(require_key)) -> Response:
+def transaction(transaction_id: str, request: Request, _: Principal = Depends(can_read)) -> Response:
     row = request.app.state.repo.get_transaction(transaction_id)
     if row is None:
         raise HTTPException(status_code=404, detail="transaction not found") from None
@@ -336,18 +420,17 @@ def transaction(transaction_id: str, request: Request, _: str = Depends(require_
 class AlertUpdate(BaseModel):
     status: Literal["IN_REVIEW", "CONFIRMED_FRAUD", "FALSE_POSITIVE", "OPEN"] | None = None
     assigned_to: str | None = None
-    actor: str = "analyst"
     notes: str | None = None
 
 
 @app.get("/v1/alerts")
 def alerts(request: Request, status: str | None = None, limit: int = Query(100, le=500),
-           _: str = Depends(require_key)) -> Response:
+           _: Principal = Depends(can_read)) -> Response:
     return json_response(request.app.state.repo.list_alerts(status, limit))
 
 
 @app.get("/v1/alerts/{alert_id}")
-def alert_detail(alert_id: int, request: Request, _: str = Depends(require_key)) -> Response:
+def alert_detail(alert_id: int, request: Request, _: Principal = Depends(can_read)) -> Response:
     row = request.app.state.repo.get_alert(alert_id)
     if row is None:
         raise HTTPException(status_code=404, detail="alert not found") from None
@@ -355,30 +438,37 @@ def alert_detail(alert_id: int, request: Request, _: str = Depends(require_key))
 
 
 @app.patch("/v1/alerts/{alert_id}")
-def update_alert(alert_id: int, body: AlertUpdate, request: Request, _: str = Depends(require_key)) -> Response:
+def update_alert(alert_id: int, body: AlertUpdate, request: Request,
+                 who: Principal = Depends(can_work_alerts)) -> Response:
     from .consumer import alert_event
     from .repository import InvalidTransition
 
     st = request.app.state
     try:
-        row = st.repo.update_alert(alert_id, body.status, body.assigned_to, body.actor, body.notes)
+        row = st.repo.update_alert(alert_id, body.status, body.assigned_to, who.name, body.notes)
     except KeyError:
         raise HTTPException(status_code=404, detail="alert not found") from None
     except InvalidTransition as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
     if hasattr(st, "gateway"):
         st.gateway.publish_update(jsonlog.dumps(alert_event(row, "UPDATED")))  # every dashboard sees it
+    auth.audit(request, who, "ALERT_UPDATE", target=str(alert_id),
+               detail=body.model_dump(exclude_none=True))
     return json_response(row)
 
 
 # ---- configuration -------------------------------------------------------------------
 @app.get("/v1/config")
-def get_config(request: Request, _: str = Depends(require_key)) -> Response:
+def get_config(request: Request, _: Principal = Depends(can_read)) -> Response:
     return json_response(request.app.state.repo.get_policy().model_dump(mode="json"))
 
 
 @app.put("/v1/config")
-def put_config(policy: Policy, request: Request, _: str = Depends(require_key)) -> Response:
+def put_config(policy: Policy, request: Request, who: Principal = Depends(admin_only)) -> Response:
     """Risk thresholds and alert settings. The scorer picks changes up within about 5 seconds."""
-    saved = request.app.state.repo.set_policy(policy, "api")
+    before = request.app.state.repo.get_policy().model_dump(mode="json")
+    saved = request.app.state.repo.set_policy(policy, who.name)
+    after = saved.model_dump(mode="json")
+    auth.audit(request, who, "CONFIG_CHANGE", target="policy",
+               detail={"changed": {k: {"from": before[k], "to": after[k]} for k in after if before.get(k) != after[k]}})
     return json_response(saved.model_dump(mode="json"))
