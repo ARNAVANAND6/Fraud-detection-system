@@ -619,6 +619,8 @@ async def stream(request: Request, org_id: str | None = None,
             first = live_state.latest_stats if org == ALL else live_state.org_stats.get(org)
             if first is None and org != ALL:
                 first = await asyncio.to_thread(request.app.state.repo.stats, None, org)
+                # Same latency figures every organisation's stats carry, so the first screen is complete.
+                first["performance"] = await asyncio.to_thread(live_state.performance)
             if first is not None:
                 yield f"event: stats\ndata: {jsonlog.dumps(first)}\n\n"
             while q in hub.clients:

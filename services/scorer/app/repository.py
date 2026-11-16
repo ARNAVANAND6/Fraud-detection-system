@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 import psycopg
 from fraudlib.policy import Policy, alert_priority, alert_triggers
@@ -13,6 +13,8 @@ from fraudlib.schemas import RiskScore, Source, TransactionEvent
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
+
+from . import rollup
 
 # Allowed case transitions; anything else is rejected.
 TRANSITIONS = {
@@ -53,6 +55,7 @@ class Repository:
     def ensure_schema(self, c=None) -> None:
         """Bring an older database up to date: auth tables, organisations. Safe to run at every start."""
         from .auth import AUTH_SCHEMA
+        from .rollup import ROLLUP_SCHEMA
         from .tenancy import TENANCY_SCHEMA
 
         if c is None:
@@ -62,6 +65,7 @@ class Repository:
         c.execute("SELECT pg_advisory_xact_lock(7461)")
         c.execute(AUTH_SCHEMA)
         c.execute(TENANCY_SCHEMA)
+        c.execute(ROLLUP_SCHEMA)
 
     def ensure_auth(self, admin_username: str, admin_password_hash: str,
                     superadmin_username: str | None = None, superadmin_password_hash: str | None = None) -> None:
@@ -334,31 +338,41 @@ class Repository:
 
     # ---- the scoring write path -------------------------------------------------
     def save_scored(self, event: TransactionEvent, source: Source, ingested_at: datetime, score: RiskScore,
-                    features: dict, feature_ms: float, policy: Policy) -> dict:
+                    features: dict, feature_ms: float, policy: Policy, c=None,
+                    counts: rollup.Batch | None = None) -> dict:
         """Persist one scored transaction and run the alert engine.
 
+        With `c` it runs inside the caller's transaction (the scorer stores a whole poll in one
+        transaction) and adds to the caller's `counts`, which the caller writes before committing.
         Returns {"inserted": bool, "row": prediction fields, "alert": alert row or None}.
         """
-        with self.pool.connection() as c, c.transaction():
-            row = c.execute(
-                """INSERT INTO predictions (org_id, transaction_id, source, account_id, counterparty_id, txn_type,
-                       amount, region, event_time, ingested_at, scored_at, risk_score, risk_level, decision,
-                       reason_codes, model_version, features, feature_ms, inference_ms, pipeline_ms)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                           extract(epoch FROM clock_timestamp() - %s::timestamptz) * 1000)
-                   ON CONFLICT (org_id, transaction_id) DO NOTHING
-                   RETURNING persisted_at, pipeline_ms""",
-                (_org(event), event.transaction_id, source.value, event.account_id, event.counterparty_id,
-                 event.txn_type.value, event.amount, event.region, event.event_time, ingested_at,
-                 score.scored_at, score.risk_score, score.risk_level.value, score.decision.value,
-                 score.reason_codes, score.model_version, json.dumps(_json_safe(features)), feature_ms,
-                 score.latency_ms, ingested_at),
-            ).fetchone()
-            if row is None:
-                return {"inserted": False, "row": None, "alert": None}
-            triggers = alert_triggers(policy, score.risk_level, score.rule_categories)
-            alert = self._raise_alert(c, event, score, triggers, policy) if triggers else None
-            return {"inserted": True, "row": row, "alert": alert}
+        if c is None:
+            with self.pool.connection() as conn, conn.transaction():
+                own = rollup.Batch()
+                out = self.save_scored(event, source, ingested_at, score, features, feature_ms, policy, conn, own)
+                own.flush(conn)
+                return out
+        row = c.execute(
+            """INSERT INTO predictions (org_id, transaction_id, source, account_id, counterparty_id, txn_type,
+                   amount, region, event_time, ingested_at, scored_at, risk_score, risk_level, decision,
+                   reason_codes, model_version, features, feature_ms, inference_ms, pipeline_ms)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                       extract(epoch FROM clock_timestamp() - %s::timestamptz) * 1000)
+               ON CONFLICT (org_id, transaction_id) DO NOTHING
+               RETURNING persisted_at, scored_at, pipeline_ms""",
+            (_org(event), event.transaction_id, source.value, event.account_id, event.counterparty_id,
+             event.txn_type.value, event.amount, event.region, event.event_time, ingested_at,
+             score.scored_at, score.risk_score, score.risk_level.value, score.decision.value,
+             score.reason_codes, score.model_version, json.dumps(_json_safe(features)), feature_ms,
+             score.latency_ms, ingested_at),
+        ).fetchone()
+        if row is None:
+            return {"inserted": False, "row": None, "alert": None}
+        counts.add(_org(event), source.value, event.amount, score.risk_score, score.risk_level.value,
+                   row["persisted_at"], row["scored_at"])
+        triggers = alert_triggers(policy, score.risk_level, score.rule_categories)
+        alert = self._raise_alert(c, event, score, triggers, policy) if triggers else None
+        return {"inserted": True, "row": row, "alert": alert}
 
     def _raise_alert(self, c, event: TransactionEvent, score: RiskScore, triggers: list[str],
                      policy: Policy) -> dict:
@@ -567,36 +581,36 @@ class Repository:
         f = ("WHERE " + " AND ".join(conds)) if conds else ""
         and_f = ("AND " + " AND ".join(conds)) if conds else ""
         org_f, org_p = ("WHERE org_id = %s", [org]) if org else ("", [])
+        hsum = ", ".join(f"coalesce(sum(h{i}), 0) AS h{i}" for i in range(1, 11))
         with self.pool.connection() as c:
+            # Totals, levels and the histogram come from running totals (rollup.py), not a table scan.
             totals = c.execute(
-                f"""SELECT count(*) AS processed, coalesce(sum(amount), 0)::float AS total_volume,
-                           count(*) FILTER (WHERE risk_level IN ('HIGH', 'CRITICAL')) AS high_risk,
-                           count(*) FILTER (WHERE risk_level = 'CRITICAL') AS critical,
-                           coalesce(avg(risk_score), 0) AS avg_risk_score,
-                           max(persisted_at) AS last_event_at, max(scored_at) AS last_inference_at
-                    FROM predictions {f}""", params).fetchone()
+                f"""SELECT coalesce(sum(txns), 0) AS processed, coalesce(sum(volume), 0)::float AS total_volume,
+                           coalesce(sum(high + critical), 0) AS high_risk, coalesce(sum(critical), 0) AS critical,
+                           coalesce(sum(risk_sum) / nullif(sum(txns), 0), 0) AS avg_risk_score,
+                           max(last_persisted_at) AS last_event_at, max(last_scored_at) AS last_inference_at,
+                           coalesce(sum(low), 0) AS low, coalesce(sum(medium), 0) AS medium,
+                           coalesce(sum(high), 0) AS high, {hsum}
+                    FROM stats_total {f}""", params).fetchone()
+            # The last 60 seconds exactly, from the (org_id, persisted_at) index: a short range, not a scan.
             minute = c.execute(
                 f"""SELECT count(*) AS n FROM predictions
-                    WHERE persisted_at > clock_timestamp() - interval '60 seconds' {and_f}""", params).fetchone()
-            levels = c.execute(
-                f"SELECT risk_level, count(*) AS n FROM predictions {f} GROUP BY 1", params).fetchall()
-            hist = c.execute(
-                f"""SELECT width_bucket(risk_score, 0, 1.000001, 10) AS bucket, count(*) AS n
-                    FROM predictions {f} GROUP BY 1 ORDER BY 1""", params).fetchall()
+                    WHERE persisted_at > now() - interval '60 seconds' {and_f}""", params).fetchone()
             trend = c.execute(
-                f"""SELECT date_trunc('minute', persisted_at) AS minute, count(*) AS txns,
-                           count(*) FILTER (WHERE risk_level IN ('HIGH', 'CRITICAL')) AS high_risk,
-                           coalesce(sum(amount), 0)::float AS volume
-                    FROM predictions WHERE persisted_at > clock_timestamp() - interval '30 minutes' {and_f}
-                    GROUP BY 1 ORDER BY 1""", params).fetchall()
+                f"""SELECT minute, sum(txns) AS txns, sum(high_risk) AS high_risk, sum(volume)::float AS volume
+                    FROM stats_minute WHERE minute > date_trunc('minute', now()) - interval '30 minutes'
+                    {and_f} GROUP BY 1 ORDER BY 1""", params).fetchall()
+            org_and = "AND org_id = %s" if org else ""
             sources = c.execute(
-                f"""SELECT source, count(*) AS txns, coalesce(sum(amount), 0)::float AS volume,
-                          count(*) FILTER (WHERE risk_level IN ('HIGH', 'CRITICAL')) AS high_risk,
-                          max(persisted_at) AS last_event_at,
-                          count(*) FILTER (WHERE persisted_at > clock_timestamp() - interval '60 seconds')
-                            AS last_minute
-                   FROM predictions {org_f} GROUP BY source ORDER BY txns DESC""",
-                org_p).fetchall()
+                f"""SELECT t.source, sum(t.txns) AS txns, sum(t.volume)::float AS volume,
+                           sum(t.high + t.critical) AS high_risk, max(t.last_persisted_at) AS last_event_at,
+                           coalesce(max(m.n), 0) AS last_minute
+                    FROM stats_total t LEFT JOIN (
+                        SELECT source, count(*) AS n FROM predictions
+                        WHERE persisted_at > now() - interval '60 seconds' {org_and}
+                        GROUP BY source) m ON m.source = t.source
+                    {"WHERE t.org_id = %s" if org else ""} GROUP BY t.source ORDER BY txns DESC""",
+                org_p + org_p).fetchall()
             alerts = c.execute(
                 f"""SELECT count(*) AS total,
                           count(*) FILTER (WHERE status = 'OPEN') AS open,
@@ -606,13 +620,12 @@ class Repository:
                           count(*) FILTER (WHERE escalation_level > 0 AND status IN ('OPEN','IN_REVIEW')) AS escalated,
                           count(*) FILTER (WHERE status = 'OPEN' AND sla_due_at < clock_timestamp()) AS sla_breached
                    FROM alerts {org_f}""", org_p).fetchone()
-            quality = c.execute(
-                f"""SELECT count(*) AS labelled,
-                           count(*) FILTER (WHERE l.is_fraud AND p.risk_level IN ('HIGH','CRITICAL')) AS tp,
-                           count(*) FILTER (WHERE NOT l.is_fraud AND p.risk_level IN ('HIGH','CRITICAL')) AS fp,
-                           count(*) FILTER (WHERE l.is_fraud AND p.risk_level NOT IN ('HIGH','CRITICAL')) AS fn
-                    FROM labels l JOIN predictions p USING (org_id, transaction_id)
-                        {f.replace("source", "p.source")}""", params).fetchone()
+        quality = self._label_quality(source, org, f, params)
+        levels = [{"risk_level": lv, "n": totals[lv.lower()]} for lv in rollup.LEVELS
+                  if lv != "CRITICAL" and totals[lv.lower()]]
+        if totals["critical"]:
+            levels.append({"risk_level": "CRITICAL", "n": totals["critical"]})
+        hist = [{"bucket": i, "n": totals[f"h{i}"]} for i in range(1, 11) if totals[f"h{i}"]]
         return {
             "source_filter": source,
             "org_filter": org,
@@ -633,7 +646,41 @@ class Repository:
             "label_quality": quality,
         }
 
+    _quality_cache: dict = {}
+
+    def _label_quality(self, source, org, f, params) -> dict:
+        """Model accuracy against labels. It joins every label to its prediction, so it is
+        recounted at most once a minute; `measured_at` says when."""
+        key = (source, org)
+        hit = self._quality_cache.get(key)
+        if hit and time.monotonic() - hit[0] < 60:
+            return hit[1]
+        with self.pool.connection() as c:
+            q = c.execute(
+                f"""SELECT count(*) AS labelled,
+                           count(*) FILTER (WHERE l.is_fraud AND p.risk_level IN ('HIGH','CRITICAL')) AS tp,
+                           count(*) FILTER (WHERE NOT l.is_fraud AND p.risk_level IN ('HIGH','CRITICAL')) AS fp,
+                           count(*) FILTER (WHERE l.is_fraud AND p.risk_level NOT IN ('HIGH','CRITICAL')) AS fn,
+                           clock_timestamp() AS measured_at
+                    FROM labels l JOIN predictions p USING (org_id, transaction_id)
+                        {f.replace("source", "p.source").replace("org_id", "p.org_id")}""", params).fetchone()
+        self._quality_cache[key] = (time.monotonic(), q)
+        return q
+
+    _perf_cache: dict = {}
+
     def performance(self, window_minutes: int = 5, org: str | None = None) -> dict:
+        """Measured latency percentiles over the last N minutes of stored rows, recomputed at most
+        every 5 seconds (it sorts every row in the window). `computed_at` says when."""
+        key = (window_minutes, org)
+        hit = self._perf_cache.get(key)
+        if hit and time.monotonic() - hit[0] < 5:
+            return hit[1]
+        out = self._performance(window_minutes, org)
+        self._perf_cache[key] = (time.monotonic(), out)
+        return out
+
+    def _performance(self, window_minutes: int = 5, org: str | None = None) -> dict:
         """Measured latency percentiles over the last N minutes of stored rows.
 
         Historical imports are excluded from latency: they are bulk-loaded, so
@@ -647,7 +694,7 @@ class Repository:
                        percentile_cont(ARRAY[0.5, 0.95, 0.99]) WITHIN GROUP (ORDER BY feature_ms) AS feature,
                        min(persisted_at) AS first_at, max(persisted_at) AS last_at
                     FROM predictions
-                    WHERE persisted_at > clock_timestamp() - make_interval(mins => %s) AND {LIVE_SOURCES_SQL}
+                    WHERE persisted_at > now() - make_interval(mins => %s) AND {LIVE_SOURCES_SQL}
                       AND (%s::text IS NULL OR org_id = %s)""",
                 (window_minutes, org, org)).fetchone()
 
@@ -663,6 +710,7 @@ class Repository:
             "pipeline_ms": pct(row["pipeline"]),     # ingested -> persisted (end to end)
             "inference_ms": pct(row["inference"]),   # rules + model
             "feature_ms": pct(row["feature"]),       # Redis read + update
+            "computed_at": datetime.now(UTC).isoformat(),
         }
 
     def recent_features(self, hours: int = 24, limit: int = 20_000) -> tuple[list[dict], float]:
@@ -670,7 +718,7 @@ class Repository:
         with self.pool.connection() as c:
             rows = c.execute(
                 f"""SELECT features, persisted_at FROM predictions
-                    WHERE persisted_at > clock_timestamp() - make_interval(hours => %s) AND {LIVE_SOURCES_SQL}
+                    WHERE persisted_at > now() - make_interval(hours => %s) AND {LIVE_SOURCES_SQL}
                     ORDER BY persisted_at DESC LIMIT %s""", (hours, limit)).fetchall()
         if not rows:
             return [], 0.0

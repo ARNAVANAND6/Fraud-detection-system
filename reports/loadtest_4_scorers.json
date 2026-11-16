@@ -1,0 +1,24 @@
+{
+  "measured_at": "2026-11-16T11:55:03.731908+00:00",
+  "events_sent": 60000,
+  "burst_seconds": 12.1,
+  "burst_rate_events_per_s": 4961.5,
+  "peak_backlog": 51827,
+  "measured_window_seconds": 67.5,
+  "stored_in_window": 47380.0,
+  "max_throughput_events_per_s": 701.4,
+  "total_stored_during_test": 60000.0,
+  "pipeline_mode": "direct",
+  "scorer_processes": 4,
+  "api_processes": 2,
+  "inference_ms": {
+    "p50": 0.253,
+    "p95": 0.897,
+    "p99": 3.525
+  },
+  "machine": {
+    "cpus": 4,
+    "platform": "Linux-6.18.44-fc-v470-x86_64-with-glibc2.39"
+  },
+  "note": "One database transaction per event in each scorer process. All processes, Kafka, Redis and PostgreSQL share one machine. Latency during this test is dominated by queueing and is not the latency under normal load."
+}

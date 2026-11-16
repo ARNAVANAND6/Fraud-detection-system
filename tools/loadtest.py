@@ -41,6 +41,7 @@ def main() -> None:
     ap.add_argument("--key", default=os.environ.get("API_KEY", "dev-key"))
     ap.add_argument("--burst-rate", type=int, default=5000, help="generator ticks per second during the burst")
     ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--out", default="reports/loadtest.json")
     a = ap.parse_args()
 
     status = get(a.api, a.key, "/v1/status")
@@ -90,13 +91,17 @@ def main() -> None:
         "max_throughput_events_per_s": round(stored / seconds, 1),
         "total_stored_during_test": samples[-1][1] - start_processed,
         "pipeline_mode": status["pipeline_mode"],
+        "scorer_processes": sum(1 for n in status.get("nodes", []) if n["kind"] == "scorer" and n["alive"]),
+        "api_processes": sum(1 for n in status.get("nodes", []) if n["kind"] == "api" and n["alive"]),
         "inference_ms": perf.get("inference_ms"),
         "machine": {"cpus": os.cpu_count(), "platform": platform.platform()},
-        "note": "Single scorer process, one database transaction per event. Latency during this test is "
-                "dominated by queueing and is not the latency under normal load.",
+        "note": "One database transaction per event in each scorer process. All processes, Kafka, Redis and "
+                "PostgreSQL share one machine. Latency during this test is dominated by queueing and is not "
+                "the latency under normal load.",
     }
-    (ROOT / "reports").mkdir(exist_ok=True)
-    (ROOT / "reports" / "loadtest.json").write_text(json.dumps(result, indent=2))
+    out = ROOT / a.out
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))
 
 
