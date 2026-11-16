@@ -22,6 +22,7 @@ TRANSITIONS = {
     "IN_REVIEW": {"CONFIRMED_FRAUD", "FALSE_POSITIVE", "OPEN"},
     "CONFIRMED_FRAUD": set(),
     "FALSE_POSITIVE": set(),
+    "DISMISSED": {"OPEN"},          # closed unreviewed by an admin; can be reopened, never a verdict
 }
 LIVE_SOURCES_SQL = "source <> 'HISTORICAL_IMPORT'"
 
@@ -527,6 +528,24 @@ class Repository:
                     (to_status == "CONFIRMED_FRAUD", alert_id))
         return row
 
+    def dismiss_stale(self, org: str, older_than_hours: int, actor: str) -> int:
+        """Close alerts still OPEN (nobody started a review) with no new activity for `older_than_hours`.
+        No label is written:
+        closing a backlog is not a finding. Alerts raised by a customer's own report are never closed here."""
+        with self.pool.connection() as c, c.transaction():
+            n = c.execute(
+                """WITH gone AS (
+                       UPDATE alerts SET status = 'DISMISSED', updated_at = clock_timestamp()
+                       WHERE org_id = %s AND status = 'OPEN'
+                         AND last_event_at < clock_timestamp() - make_interval(hours => %s)
+                         AND NOT ('CUSTOMER_REPORT' = ANY (trigger_types))
+                       RETURNING alert_id)
+                   INSERT INTO alert_events (alert_id, kind, detail, actor)
+                   SELECT alert_id, 'STATUS', %s, %s FROM gone""",
+                (org, older_than_hours, Jsonb({"from": "OPEN", "to": "DISMISSED", "reason": "stale backlog"}),
+                 actor)).rowcount
+        return n
+
     def get_transaction(self, transaction_id: str, org: str | None = None) -> dict | None:
         """One transaction. Without `org` (superadmin) the id may exist in several organisations:
         the most recent is returned."""
@@ -617,6 +636,7 @@ class Repository:
                           count(*) FILTER (WHERE status = 'IN_REVIEW') AS in_review,
                           count(*) FILTER (WHERE status = 'CONFIRMED_FRAUD') AS confirmed,
                           count(*) FILTER (WHERE status = 'FALSE_POSITIVE') AS false_positive,
+                          count(*) FILTER (WHERE status = 'DISMISSED') AS dismissed,
                           count(*) FILTER (WHERE escalation_level > 0 AND status IN ('OPEN','IN_REVIEW')) AS escalated,
                           count(*) FILTER (WHERE status = 'OPEN' AND sla_due_at < clock_timestamp()) AS sla_breached
                    FROM alerts {org_f}""", org_p).fetchone()
@@ -766,7 +786,7 @@ class Repository:
                     """UPDATE alerts SET priority = least(priority, 2),
                            trigger_types = ARRAY(SELECT DISTINCT unnest(trigger_types || '{CUSTOMER_REPORT}')),
                            reason_codes = ARRAY(SELECT DISTINCT unnest(reason_codes || %s::text[])),
-                           status = CASE WHEN status = 'FALSE_POSITIVE' THEN 'OPEN' ELSE status END,
+                           status = CASE WHEN status IN ('FALSE_POSITIVE', 'DISMISSED') THEN 'OPEN' ELSE status END,
                            updated_at = clock_timestamp() WHERE alert_id = %s""", ([reason], alert_id))
             else:
                 alert_id = c.execute(
