@@ -183,4 +183,4 @@ def _free_username(repo, base: str) -> str:
 
 
 def back_to_dashboard(request: Request, fragment: dict) -> str:
-    return request.app.state.settings.dashboard_url + "/#" + urllib.parse.urlencode(fragment)
+    return request.app.state.settings.dashboard_url + "/console#" + urllib.parse.urlencode(fragment)

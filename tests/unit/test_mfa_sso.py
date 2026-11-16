@@ -187,7 +187,7 @@ def run_sso(c, fake, code="good-code"):
     assert q["code_challenge_method"] == ["S256"] and q["client_id"] == ["vyrox"]
     fake.nonce = q["nonce"][0]
     back = c.get("/v1/auth/sso/callback", params={"code": code, "state": q["state"][0]}, follow_redirects=False)
-    assert back.status_code == 302 and back.headers["location"].startswith("https://risk.example/#")
+    assert back.status_code == 302 and back.headers["location"].startswith("https://risk.example/console#")
     return urllib.parse.parse_qs(urllib.parse.urlparse(back.headers["location"]).fragment), q["state"][0]
 
 

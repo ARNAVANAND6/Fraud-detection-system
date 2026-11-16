@@ -16,8 +16,9 @@ type Tab = "platform" | "overview" | "alerts" | "check" | "performance" | "integ
 const TABS: Record<Role, Tab[]> = {
   VIEWER: ["overview", "alerts", "performance", "integrations", "security"],
   ANALYST: ["overview", "alerts", "check", "performance", "integrations", "security"],
-  ADMIN: ["overview", "alerts", "check", "performance", "integrations", "ingest", "settings", "admin", "security"],
-  SUPERADMIN: ["platform", "overview", "alerts", "performance", "integrations", "admin", "security"],
+  // Risk settings apply to every organisation, so only the platform operator changes them.
+  ADMIN: ["overview", "alerts", "check", "performance", "integrations", "ingest", "admin", "security"],
+  SUPERADMIN: ["platform", "overview", "alerts", "performance", "integrations", "settings", "admin", "security"],
   CUSTOMER: [],
 };
 const NAV: { group: string; tabs: Tab[] }[] = [
@@ -1220,7 +1221,13 @@ function Platform({ now }: { now: number }) {
 
 // ---- customer portal ----------------------------------------------------------------------
 
-const TXN_STATUS: Record<CustomerTxn["status"], string> = { OK: "Completed", UNDER_REVIEW: "Being checked", HELD: "On hold" };
+const TXN_KIND: Record<string, string> = {
+  TRANSFER: "Transfer", PAYMENT: "Payment", CASH_OUT: "Cash withdrawal", DEBIT: "Debit", CASH_IN: "Deposit",
+};
+const REPORT_STATUS: Record<string, string> = {
+  UNDER_REVIEW: "Being checked by the bank", CONFIRMED_FRAUD: "Confirmed as fraud", CLOSED_NO_FRAUD: "Closed: no fraud found",
+};
+const TXN_STATUS: Record<CustomerTxn["status"], string> = { OK: "Completed", UNDER_REVIEW: "Being checked", CONFIRMED_FRAUD: "Stopped as fraud" };
 const REPORT_KIND: Record<ReportKind, string> = { NOT_ME: "I did not make this payment", SCAM: "I was tricked into paying", OTHER: "Something else" };
 
 function CustomerPortal({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
@@ -1265,13 +1272,13 @@ function CustomerPortal({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           {txns && (
             <div className="table-wrap">
               <table data-testid="my-payments">
-                <thead><tr><th>When</th><th>To</th><th>Channel</th><th className="r">Amount</th><th>Status</th><th></th></tr></thead>
+                <thead><tr><th>When</th><th>To</th><th>Type</th><th className="r">Amount</th><th>Status</th><th></th></tr></thead>
                 <tbody>
                   {txns.map((t) => (
                     <tr key={t.transaction_id}>
-                      <td>{new Date(t.event_time).toLocaleString()}</td><td className="mono">{t.counterparty_id}</td><td>{t.channel}</td>
+                      <td>{new Date(t.event_time).toLocaleString()}</td><td className="mono">{t.counterparty_id}</td><td>{TXN_KIND[t.txn_type] ?? t.txn_type}</td>
                       <td className="r">{inr(t.amount)}</td>
-                      <td><span className={`status ${t.status === "OK" ? "s-OPEN" : t.status === "HELD" ? "s-CONFIRMED_FRAUD" : "s-IN_REVIEW"}`}>{TXN_STATUS[t.status]}</span></td>
+                      <td><span className={`status ${t.status === "OK" ? "s-OPEN" : t.status === "CONFIRMED_FRAUD" ? "s-CONFIRMED_FRAUD" : "s-IN_REVIEW"}`}>{TXN_STATUS[t.status]}</span></td>
                       <td className="r">{t.reported ? <span className="muted small">reported</span>
                         : <button onClick={() => { setOpen(t); setSent(""); }}>Report a problem</button>}</td>
                     </tr>
@@ -1281,7 +1288,7 @@ function CustomerPortal({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
               </table>
             </div>
           )}
-          <p className="note">"On hold" means the payment is paused while it is checked. Your bank may contact you; it will never ask for your OTP or PIN.</p>
+          <p className="note">"Being checked" means your bank's fraud team is looking at the payment. Your bank may contact you; it will never ask for your OTP or PIN.</p>
         </div>
 
         {open && (
@@ -1306,7 +1313,7 @@ function CustomerPortal({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
               <tbody>
                 {reports.map((r, i) => (
                   <tr key={r.report_id ?? i}><td>{new Date(r.created_at).toLocaleString()}</td><td className="mono">{r.transaction_id}</td>
-                    <td>{REPORT_KIND[r.kind]}</td><td>{r.status?.toLowerCase() ?? "received"}</td></tr>
+                    <td>{REPORT_KIND[r.kind]}</td><td>{REPORT_STATUS[r.status ?? ""] ?? "Received"}</td></tr>
                 ))}
                 {!reports.length && <tr><td className="muted">You have not reported anything.</td></tr>}
               </tbody>

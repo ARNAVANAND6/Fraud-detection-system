@@ -132,9 +132,17 @@ export interface Org {
   users: number; transactions_24h: number; open_alerts: number; last_event_at: string | null;
 }
 export interface ApiKey { id: string; label: string; prefix: string; created_at: string; last_used_at: string | null; created_by?: string }
+interface ServerKey {
+  key_id: string; name: string; prefix: string; created_at: string; last_used_at?: string | null;
+  created_by?: string; revoked_at?: string | null;
+}
+const toKey = (k: ServerKey): ApiKey => ({
+  id: k.key_id, label: k.name, prefix: k.prefix, created_at: k.created_at,
+  last_used_at: k.last_used_at ?? null, created_by: k.created_by,
+});
 export interface CustomerTxn {
-  transaction_id: string; event_time: string; counterparty_id: string; amount: number; channel: string;
-  status: "OK" | "UNDER_REVIEW" | "HELD"; reported: boolean;
+  transaction_id: string; event_time: string; counterparty_id: string; amount: number; txn_type: string;
+  status: "OK" | "UNDER_REVIEW" | "CONFIRMED_FRAUD"; reported: boolean;
 }
 export type ReportKind = "NOT_ME" | "SCAM" | "OTHER";
 export interface CustomerReport { report_id?: number; transaction_id: string; kind: ReportKind; note?: string | null; created_at: string; status?: string }
@@ -151,8 +159,11 @@ export const api = {
     call<Org>("/v1/orgs", { method: "POST", body: JSON.stringify({ org_id, name, region }) }),
   updateOrg: (org_id: string, body: { name?: string; region?: string; status?: "ACTIVE" | "SUSPENDED" }) =>
     call<Org>(`/v1/orgs/${encodeURIComponent(org_id)}`, { method: "PATCH", body: JSON.stringify(body) }),
-  apiKeys: () => call<ApiKey[]>("/v1/api-keys"),
-  createApiKey: (label: string) => call<ApiKey & { key: string }>("/v1/api-keys", { method: "POST", body: JSON.stringify({ label }) }),
+  // The server names these key_id and name; revoked keys are listed by the server but not shown here.
+  apiKeys: () => call<ServerKey[]>("/v1/api-keys").then((ks) => ks.filter((k) => !k.revoked_at).map(toKey)),
+  createApiKey: (label: string) =>
+    call<ServerKey & { key: string }>("/v1/api-keys", { method: "POST", body: JSON.stringify({ name: label }) })
+      .then((k) => ({ ...toKey(k), key: k.key })),
   deleteApiKey: (id: string) => call<void>(`/v1/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" }),
   myTransactions: (limit = 50) => call<CustomerTxn[]>(`/v1/me/transactions?limit=${limit}`),
   myReports: () => call<CustomerReport[]>("/v1/me/reports"),
