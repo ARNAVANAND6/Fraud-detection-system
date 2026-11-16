@@ -1,6 +1,6 @@
 # Deployment and operations
 
-How to run VYROX for a pilot, and how to look after it. The application processes (API and scorer) can
+How to run Foresentry for a pilot, and how to look after it. The application processes (API and scorer) can
 run two or more of each, so losing one does not stop the service (see "Several servers"). Kafka, Redis and
 PostgreSQL as shipped are one container each: if one of those stops, scoring stops until it is back
 (nothing accepted is lost, see Recovery).
@@ -10,14 +10,14 @@ PostgreSQL as shipped are one container each: if one of those stops, scoring sto
 - A Linux server with Docker. 4 cores and 8 GB of RAM are enough for direct mode at tens of events per second;
   Spark mode needs about 8 GB free for itself.
 - A host name pointing at the server, with ports 80 and 443 reachable, for a public certificate.
-- An authorised source of transactions. VYROX has none built in.
+- An authorised source of transactions. Foresentry has none built in.
 
 ## First start
 
 ```bash
 cp .env.production.example .env
 # In .env set long random values for POSTGRES_PASSWORD (also inside DATABASE_URL), API_KEYS,
-# WEBHOOK_SECRET and ADMIN_PASSWORD, then add:
+# WEBHOOK_SECRET, ADMIN_PASSWORD and SUPERADMIN_PASSWORD, then add:
 #   SITE_ADDRESS=risk.example.com
 #   DASHBOARD_API_URL=
 #   PIPELINE_MODE=direct            (or spark, if the lake is wanted in the scoring path)

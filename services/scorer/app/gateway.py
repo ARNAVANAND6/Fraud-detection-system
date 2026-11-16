@@ -24,6 +24,11 @@ IDEMPOTENCY_TTL_S = 24 * 3600
 WEBHOOK_TOLERANCE_S = 300
 
 
+def _idem(org_id: str, transaction_id: str) -> str:
+    # Transaction ids are unique per organisation; "demo" keeps the original key format.
+    return f"idem:{transaction_id}" if org_id == "demo" else f"idem:{org_id}|{transaction_id}"
+
+
 class PublishError(Exception):
     pass
 
@@ -36,7 +41,7 @@ class Gateway:
                                   "acks": "all", "linger.ms": 0, "message.timeout.ms": 10000})
         self.ingest_ms: deque[float] = deque(maxlen=2000)  # measured request -> Kafka ack
 
-    def ingest(self, events: list[TransactionEvent], source: Source) -> dict:
+    def ingest(self, events: list[TransactionEvent], source: Source, org_id: str = "demo") -> dict:
         """Returns {"accepted": [...ids], "duplicates": [...ids]}. Raises PublishError
         if Kafka did not acknowledge; nothing is then recorded as seen."""
         if self.s.environment == "production" and source == Source.SIMULATED_DEMO:
@@ -44,7 +49,7 @@ class Gateway:
         t0 = time.perf_counter()
         pipe = self.redis.pipeline(transaction=False)
         for e in events:
-            pipe.set(f"idem:{e.transaction_id}", source.value, nx=True, ex=IDEMPOTENCY_TTL_S)
+            pipe.set(_idem(org_id, e.transaction_id), source.value, nx=True, ex=IDEMPOTENCY_TTL_S)
         fresh_flags = pipe.execute()
         accepted, duplicates, failed = [], [], []
         seen_in_batch: set[str] = set()
@@ -59,7 +64,7 @@ class Gateway:
                 duplicates.append(e.transaction_id)
                 continue
             seen_in_batch.add(e.transaction_id)
-            stamped = e.model_copy(update={"source": source, "ingested_at": now})
+            stamped = e.model_copy(update={"source": source, "ingested_at": now, "org_id": org_id})
             self.producer.produce(self.s.topic_raw, key=e.account_id, value=stamped.model_dump_json(),
                                   headers={"transaction_id": e.transaction_id}, on_delivery=on_delivery)
             accepted.append(e.transaction_id)
@@ -70,7 +75,7 @@ class Gateway:
             # Forget the idempotency keys so the caller can safely retry.
             pipe = self.redis.pipeline(transaction=False)
             for tid in accepted:
-                pipe.delete(f"idem:{tid}")
+                pipe.delete(_idem(org_id, tid))
             pipe.execute()
             INGESTED.labels(source.value, "publish_failed").inc(len(accepted))
             raise PublishError("Kafka did not acknowledge the events; retry the request")
@@ -92,7 +97,7 @@ def verify_webhook(secret: str, timestamp: str | None, signature: str | None, bo
     if not secret:
         return "webhook secret is not configured"
     if not timestamp or not signature:
-        return "missing X-Vyrox-Timestamp or X-Vyrox-Signature"
+        return "missing X-Foresentry-Timestamp or X-Foresentry-Signature"
     try:
         skew = abs(time.time() - float(timestamp))
     except ValueError:

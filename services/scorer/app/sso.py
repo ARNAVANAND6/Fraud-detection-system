@@ -9,13 +9,13 @@ reaches the browser:
    The API exchanges it for an ID token, checks the token's signature against
    the provider's published keys, its issuer, audience, expiry and nonce, and
    requires a verified e-mail.
-3. The person is matched to a VYROX account by the provider's subject id, or
+3. The person is matched to a Foresentry account by the provider's subject id, or
    by e-mail the first time. An unknown person gets an account only if their
    e-mail domain is in OIDC_ALLOWED_DOMAINS, with OIDC_DEFAULT_ROLE.
 4. The browser goes back to the dashboard with the session token in the URL
    fragment (#sso_token=...), which browsers do not send to servers.
 
-Two-factor sign-in for SSO users is the identity provider's job; VYROX does not
+Two-factor sign-in for SSO users is the identity provider's job; Foresentry does not
 ask for its own code on top.
 """
 from __future__ import annotations
@@ -156,7 +156,7 @@ def finish(request: Request, code: str, state: str) -> dict:
         domain = email.rsplit("@", 1)[-1]
         if domain not in s.oidc_allowed_domains:
             auth.audit(request, None, "SSO_REFUSED", target=email, detail={"reason": "no account"}, actor=email)
-            raise HTTPException(status_code=403, detail="SSO: you have no VYROX account; ask an administrator")
+            raise HTTPException(status_code=403, detail="SSO: you have no Foresentry account; ask an administrator")
         username = _free_username(st.repo, email.split("@", 1)[0])
         # No usable password: this account can only sign in through the provider.
         st.repo.create_user(username, "sso-only$" + secrets.token_hex(16), s.oidc_default_role, email)
@@ -166,7 +166,8 @@ def finish(request: Request, code: str, state: str) -> dict:
     if not user["active"]:
         auth.audit(request, None, "SSO_REFUSED", target=user["username"], detail={"reason": "inactive"},
                    actor=user["username"])
-        raise HTTPException(status_code=403, detail="SSO: your VYROX account is deactivated")
+        raise HTTPException(status_code=403, detail="SSO: your Foresentry account is deactivated")
+    auth.check_org_active(request, user)
     st.repo.link_sso_subject(user["username"], subject)
     return auth.start_session(request, user, "sso")
 
@@ -182,4 +183,4 @@ def _free_username(repo, base: str) -> str:
 
 
 def back_to_dashboard(request: Request, fragment: dict) -> str:
-    return request.app.state.settings.dashboard_url + "/#" + urllib.parse.urlencode(fragment)
+    return request.app.state.settings.dashboard_url + "/console#" + urllib.parse.urlencode(fragment)

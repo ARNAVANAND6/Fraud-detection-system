@@ -44,7 +44,7 @@ REJOIN_ERRORS = {KafkaError._ASSIGNMENT_LOST, KafkaError._NO_OFFSET, KafkaError.
 
 
 def alert_event(alert: dict, kind: str) -> dict:
-    return {"type": "alert", "kind": kind, **{k: alert[k] for k in (
+    return {"type": "alert", "kind": kind, "org_id": alert.get("org_id", "demo"), **{k: alert[k] for k in (
         "alert_id", "account_id", "priority", "status", "trigger_types", "reason_codes", "max_risk_score",
         "event_count", "assigned_to", "escalation_level", "sla_due_at", "created_at", "updated_at")}}
 
@@ -57,6 +57,7 @@ class ScoringWorker:
         self.store = RedisFeatureStore(self.redis)
         self.scorer = Scorer(self.s.model_dir)
         self.repo: Repository = connect_with_retry(self.s.database_url)
+        self.repo.ensure_schema()       # organisations and keys, if the API has not started yet
         self.policy = self.repo.ensure_policy()
         self.producer = Producer({"bootstrap.servers": self.s.kafka_bootstrap, "enable.idempotence": True,
                                   "acks": "all", "linger.ms": 5})
@@ -152,7 +153,8 @@ class ScoringWorker:
         EVENTS.labels("scored").inc()
         self.processed += 1
         self.producer.produce(self.s.topic_scored, key=event.transaction_id, value=jsonlog.dumps({
-            "type": "transaction", "transaction_id": event.transaction_id, "source": source,
+            "type": "transaction", "org_id": event.org_id or "demo",
+            "transaction_id": event.transaction_id, "source": source,
             "account_id": event.account_id, "counterparty_id": event.counterparty_id,
             "txn_type": event.txn_type, "amount": event.amount, "region": event.region,
             "event_time": event.event_time, "ingested_at": ingested_at, "scored_at": score.scored_at,
@@ -230,7 +232,8 @@ class ScoringWorker:
                 if msg.topic() == s.topic_labels:
                     try:
                         lab = json.loads(msg.value())
-                        self.repo.save_label(lab["transaction_id"], bool(lab["is_fraud"]), "SIMULATOR")
+                        self.repo.save_label(lab["transaction_id"], bool(lab["is_fraud"]), "SIMULATOR",
+                                             lab.get("org_id") or "demo")
                     except (ValueError, KeyError):
                         pass
                     continue

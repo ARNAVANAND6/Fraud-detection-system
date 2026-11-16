@@ -1,9 +1,9 @@
 # Integration guide
 
-How a payment system sends transactions to VYROX and reads the result. The
+How a payment system sends transactions to Foresentry and reads the result. The
 interactive reference for every endpoint is at `/docs` on the API.
 
-VYROX has webhook adapters for two payment gateways, Razorpay and Stripe (section 2a). It has none for a
+Foresentry has webhook adapters for two payment gateways, Razorpay and Stripe (section 2a). It has none for a
 bank, UPI switch or card network: those senders map their own records to the schema below. Every sender must
 be authorised to share the data.
 
@@ -45,19 +45,23 @@ Unknown fields are rejected with 422, so a mapping mistake fails loudly.
 | `POST /v1/webhooks/generic` | Push from a system that signs its calls | HMAC signature |
 | `POST /v1/imports` | A CSV or Parquet file of past transactions | Administrator sign-in |
 
+Each organisation gets its own API key from its administrator (console, API keys, or
+`POST /v1/api-keys`). The key decides which organisation a payment belongs to; an `org_id` in the body is
+ignored. The same `transaction_id` may be used by two organisations without clashing.
+
 All three answer `202`: the transaction is durably in Kafka and will be scored. They do not return the score.
 If Kafka is unavailable they answer `503` and nothing is accepted, so the caller should retry with the same
 `transaction_id`.
 
 ```bash
 curl -X POST https://risk.example.com/v1/transactions \
-  -H "X-API-Key: $VYROX_API_KEY" -H "Content-Type: application/json" -d @transaction.json
+  -H "X-API-Key: $FORESENTRY_API_KEY" -H "Content-Type: application/json" -d @transaction.json
 ```
 
 ### Signed webhook
 
 Body: `{"event_id": "...", "type": "transaction.created", "data": { the transaction }}`.
-Headers: `X-Vyrox-Timestamp` (Unix seconds) and `X-Vyrox-Signature`, the hex HMAC-SHA256 of
+Headers: `X-Foresentry-Timestamp` (Unix seconds) and `X-Foresentry-Signature`, the hex HMAC-SHA256 of
 `<timestamp>.<raw body>` with the shared webhook secret. Calls more than 5 minutes old are rejected.
 
 ```python
@@ -67,7 +71,7 @@ ts = str(int(time.time()))
 sig = hmac.new(SECRET.encode(), ts.encode() + b"." + body, hashlib.sha256).hexdigest()
 urllib.request.urlopen(urllib.request.Request(
     "https://risk.example.com/v1/webhooks/generic", data=body,
-    headers={"Content-Type": "application/json", "X-Vyrox-Timestamp": ts, "X-Vyrox-Signature": sig}))
+    headers={"Content-Type": "application/json", "X-Foresentry-Timestamp": ts, "X-Foresentry-Signature": sig}))
 ```
 
 ## 2a. Payment-gateway connectors
@@ -123,11 +127,23 @@ A result carries `risk_score` (0 to 1), `risk_level`, `decision` (the configured
 `reason_codes` and `model_version`.
 
 **Scoring is asynchronous.** Measured in the test environment, a transaction is stored about 30 ms after
-ingestion in direct mode and about 630 ms in Spark mode (median, at 51 events per second). VYROX is built to
+ingestion in direct mode and about 630 ms in Spark mode (median, at 51 events per second). Foresentry is built to
 raise alerts for review after a payment is submitted. It has no synchronous approve-or-decline call, so it
 cannot sit inside a payment authorisation as shipped.
 
 The risk score is a model estimate for a reviewer. It is not a banking or regulatory decision.
+
+## 3a. Account holders
+
+A person with the `CUSTOMER` role is linked to one or more `account_id`s at one organisation.
+`GET /v1/me/transactions` lists their payments with a plain status (`OK`, `UNDER_REVIEW`,
+`CONFIRMED_FRAUD`) and no score. `POST /v1/me/reports` with `{"transaction_id", "kind": "NOT_ME" | "SCAM" |
+"OTHER", "note"}` opens or joins an alert (`REPORTED_BY_CUSTOMER`) for the organisation's analysts.
+Reporting the same payment again returns the first report. A payment that is not on their accounts is 404.
+
+`GET /v1/public/summary` needs no sign-in and gives platform-wide totals for the last 24 hours (payments,
+share flagged, median pipeline time, number of organisations), cached for 30 seconds, with
+`"simulated": true` in the demo environment. Nothing in it identifies an organisation, account or amount.
 
 ## 4. Feeding outcomes back
 
@@ -136,7 +152,7 @@ retraining and for measuring real precision. No separate chargeback feed is buil
 
 ## 4a. Operational alerts
 
-Set `ALERT_WEBHOOK_URL` to a Slack (or Teams, or any) incoming-webhook URL. VYROX posts `{"text": ...}` for:
+Set `ALERT_WEBHOOK_URL` to a Slack (or Teams, or any) incoming-webhook URL. Foresentry posts `{"text": ...}` for:
 
 - a new priority-1 fraud alert: its id, score and reason codes, never the account or amount. At most 10 an
   hour; the 11th message says the rest are in the queue.

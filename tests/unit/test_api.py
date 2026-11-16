@@ -55,29 +55,78 @@ class FakeRepo:
         self.policy = Policy()
         self.users, self.sessions, self.audit_rows, self.alert_updates = {}, {}, [], []
         self.challenges, self.sso_states = {}, {}
+        self.api_keys = {}
+        self.orgs = {"demo": {"org_id": "demo", "name": "Demo Bank", "region": "IN", "status": "ACTIVE"}}
 
     def get_user(self, username):
         return self.users.get(username)
 
     @staticmethod
     def _public(u):
-        return {"username": u["username"], "role": u["role"], "active": u["active"], "email": u["email"],
+        return {"username": u["username"], "role": u["role"], "org_id": u["org_id"],
+                "account_ids": u["account_ids"], "active": u["active"], "email": u["email"],
                 "mfa_enabled": u["mfa_enabled"], "sso": u["sso_subject"] is not None}
 
-    def list_users(self):
-        return [self._public(u) for u in self.users.values()]
+    def list_users(self, org=None):
+        return [self._public(u) for u in self.users.values() if org is None or u["org_id"] == org]
 
-    def create_user(self, username, password_hash, role, email=None):
+    def create_org(self, org_id, name, region):
+        if org_id in self.orgs:
+            return None
+        self.orgs[org_id] = {"org_id": org_id, "name": name, "region": region, "status": "ACTIVE"}
+        return self.orgs[org_id]
+
+    def update_org(self, org_id, name, region, status):
+        o = self.orgs.get(org_id)
+        if o is None:
+            return None
+        o.update({k: v for k, v in (("name", name), ("region", region), ("status", status)) if v})
+        if status == "SUSPENDED":
+            for t, (u, _) in list(self.sessions.items()):
+                if self.users[u]["org_id"] == org_id:
+                    del self.sessions[t]
+        return o
+
+    def get_org(self, org_id):
+        return self.orgs.get(org_id)
+
+    def org_active(self, org_id):
+        return self.orgs.get(org_id, {}).get("status") == "ACTIVE"
+
+    def find_api_key(self, key_sha256):
+        k = self.api_keys.get(key_sha256)
+        if k is None or k["revoked_at"]:
+            return None
+        return {"org_id": k["org_id"], "prefix": k["prefix"], "org_status": self.orgs[k["org_id"]]["status"]}
+
+    def create_api_key(self, key_sha256, org_id, name, prefix, created_by):
+        self.api_keys[key_sha256] = {"key_id": key_sha256[:12], "org_id": org_id, "name": name, "prefix": prefix,
+                                     "created_by": created_by, "revoked_at": None}
+        return {k: v for k, v in self.api_keys[key_sha256].items() if k != "revoked_at"}
+
+    def list_api_keys(self, org):
+        return [k for k in self.api_keys.values() if org is None or k["org_id"] == org]
+
+    def revoke_api_key(self, key_id, org):
+        for k in self.api_keys.values():
+            if k["key_id"] == key_id and not k["revoked_at"] and (org is None or k["org_id"] == org):
+                k["revoked_at"] = "now"
+                return True
+        return False
+
+    def create_user(self, username, password_hash, role, email=None, org_id="demo", account_ids=()):
         if username in self.users or (email and any(u["email"] == email for u in self.users.values())):
             return False
         self.users[username] = {"username": username, "password_hash": password_hash, "role": role, "active": True,
+                                "org_id": None if role == "SUPERADMIN" else org_id, "account_ids": list(account_ids),
                                 "email": email, "sso_subject": None, "mfa_enabled": False, "mfa_secret": None,
                                 "mfa_pending": None, "mfa_last_step": None, "mfa_recovery": []}
         return True
 
-    def update_user(self, username, role, active, password_hash, reset_mfa=False, email=None):
+    def update_user(self, username, role, active, password_hash, reset_mfa=False, email=None, org=None,
+                    account_ids=None):
         u = self.users.get(username)
-        if u is None:
+        if u is None or (org and u["org_id"] != org):
             return None
         loses_admin = u["role"] == "ADMIN" and u["active"] and (
             (role is not None and role != "ADMIN") or active is False)
@@ -86,7 +135,7 @@ class FakeRepo:
             raise ValueError("this is the last active administrator")
         changed_role = role is not None and role != u["role"]
         u.update({k: v for k, v in (("role", role), ("active", active), ("password_hash", password_hash),
-                                    ("email", email)) if v is not None})
+                                    ("email", email), ("account_ids", account_ids)) if v is not None})
         if reset_mfa:
             u.update(mfa_enabled=False, mfa_secret=None, mfa_recovery=[])
         if active is False or password_hash is not None or changed_role or reset_mfa:
@@ -99,7 +148,11 @@ class FakeRepo:
     def get_session_user(self, token_sha256):
         name, limited = self.sessions.get(token_sha256, (None, False))
         u = self.users.get(name)
-        return {"username": u["username"], "role": u["role"], "limited": limited} if u and u["active"] else None
+        if not (u and u["active"]):
+            return None
+        return {"username": u["username"], "role": u["role"], "limited": limited, "org_id": u["org_id"],
+                "account_ids": u["account_ids"],
+                "org_status": self.orgs[u["org_id"]]["status"] if u["org_id"] else None}
 
     def delete_session(self, token_sha256):
         self.sessions.pop(token_sha256, None)
@@ -162,13 +215,14 @@ class FakeRepo:
     def pop_sso_state(self, state_sha256):
         return self.sso_states.pop(state_sha256, None)
 
-    def audit(self, actor, role, action, target, detail, ip):
-        self.audit_rows.append({"actor": actor, "role": role, "action": action, "target": target, "detail": detail})
+    def audit(self, actor, role, action, target, detail, ip, org_id=None):
+        self.audit_rows.append({"actor": actor, "role": role, "action": action, "target": target, "detail": detail,
+                                "org_id": org_id})
 
-    def list_audit(self, limit):
-        return self.audit_rows[::-1][:limit]
+    def list_audit(self, limit, org=None):
+        return [a for a in self.audit_rows[::-1] if org is None or a["org_id"] == org][:limit]
 
-    def update_alert(self, alert_id, to_status, assign_to, actor, notes):
+    def update_alert(self, alert_id, to_status, assign_to, actor, notes, org=None):
         self.alert_updates.append((alert_id, to_status, actor))
         return {"alert_id": alert_id, "status": to_status, "account_id": "C1", "priority": 1, "trigger_types": [],
                 "reason_codes": [], "max_risk_score": 0.9, "event_count": 1, "assigned_to": assign_to,
@@ -192,13 +246,14 @@ def make_client(monkeypatch, tmp_path, environment="demo", rate="1000"):
     monkeypatch.setenv("API_KEYS", "test-key")
     monkeypatch.setenv("WEBHOOK_SECRET", SECRET)
     monkeypatch.setenv("ADMIN_PASSWORD", PASSWORD)
+    monkeypatch.setenv("SUPERADMIN_PASSWORD", PASSWORD + "-super")
     monkeypatch.setenv("ENVIRONMENT", environment)
     monkeypatch.setenv("RATE_LIMIT_PER_MINUTE", rate)
     monkeypatch.setenv("SECRET_KEY", "unit-test-secret-key-that-is-long-enough")
     r = fakeredis.FakeRedis()
     st = app.state
     st.redis, st.store, st.scorer, st.repo = r, RedisFeatureStore(r), Scorer(tmp_path), FakeRepo()
-    for name, role in (("admin", "ADMIN"), ("asha", "ANALYST"), ("vik", "VIEWER")):
+    for name, role in (("admin", "ADMIN"), ("asha", "ANALYST"), ("vik", "VIEWER"), ("root", "SUPERADMIN")):
         st.repo.create_user(name, PASSWORD_HASH, role)
     gw = Gateway.__new__(Gateway)
     gw.s, gw.redis, gw.producer, gw.ingest_ms = get_settings(), r, FakeProducer(), deque(maxlen=100)
@@ -235,7 +290,7 @@ def sent(client_):
 def sign(body: bytes, ts: float | None = None, secret: str = SECRET) -> dict:
     ts = str(int(ts if ts is not None else time.time()))
     sig = hmac.new(secret.encode(), ts.encode() + b"." + body, hashlib.sha256).hexdigest()
-    return {"X-Vyrox-Timestamp": ts, "X-Vyrox-Signature": f"sha256={sig}", "Content-Type": "application/json"}
+    return {"X-Foresentry-Timestamp": ts, "X-Foresentry-Signature": f"sha256={sig}", "Content-Type": "application/json"}
 
 
 def test_requires_api_key(client):
@@ -253,7 +308,7 @@ def test_rest_ingest_publishes_once_and_stamps_source(client):
     topic, key, value = sent(client)[0]
     assert topic == "demo.payments.transactions.v1" and key == "C1"
     assert value["source"] == "LIVE_API" and value["ingested_at"]
-    assert r.headers["X-Vyrox-Environment"] == "demo"
+    assert r.headers["X-Foresentry-Environment"] == "demo"
 
 
 def test_caller_cannot_choose_the_source_label(client):
@@ -330,7 +385,7 @@ def test_demo_scenario_is_labelled_simulated(client):
 def test_production_has_no_demo_scenario_and_uses_its_own_topics(prod_client):
     assert prod_client.post("/v1/demo/scenario", json={}, headers=as_user(prod_client)).status_code == 404
     r = prod_client.post("/v1/transactions", json=EVENT, headers=KEY)
-    assert r.status_code == 202 and r.headers["X-Vyrox-Environment"] == "production"
+    assert r.status_code == 202 and r.headers["X-Foresentry-Environment"] == "production"
     assert sent(prod_client)[0][0] == "production.payments.transactions.v1"
     from fraudlib.schemas import Source, TransactionEvent
     with pytest.raises(PermissionError):
@@ -348,6 +403,9 @@ def test_production_refuses_demo_credentials(monkeypatch):
     with pytest.raises(RuntimeError, match="ADMIN_PASSWORD"):
         get_settings().assert_safe_for_production()  # the demo administrator password alone is enough to refuse
     monkeypatch.setenv("ADMIN_PASSWORD", "a-real-admin-password")
+    with pytest.raises(RuntimeError, match="SUPERADMIN_PASSWORD"):
+        get_settings().assert_safe_for_production()
+    monkeypatch.setenv("SUPERADMIN_PASSWORD", "a-real-superadmin-password")
     with pytest.raises(RuntimeError, match="SECRET_KEY"):
         get_settings().assert_safe_for_production()  # the demo key would let anyone decrypt 2FA secrets
     monkeypatch.setenv("SECRET_KEY", "x" * 40)
@@ -360,7 +418,7 @@ def test_dry_run_score_contract_and_config(client):
     body = r.json()
     assert set(body) >= {"risk_score", "risk_level", "decision", "reason_codes", "model_version", "scored_at"}
     assert "BALANCE_DRAIN" in body["reason_codes"] and sent(client) == []
-    cfg, admin = client.get("/v1/config", headers=KEY).json(), as_user(client)
+    cfg, admin = client.get("/v1/config", headers=KEY).json(), as_user(client, "root")
     cfg["thresholds"] = {"medium": 0.1, "high": 0.2, "critical": 0.3}
     assert client.put("/v1/config", json=cfg, headers=admin).status_code == 200
     assert client.post("/v1/score", json=EVENT, headers=KEY).json()["risk_level"] == "CRITICAL"
@@ -395,7 +453,8 @@ def test_sign_in_and_out(client):
     assert client.post("/v1/auth/login", json={"username": "asha", "password": "wrong-password"}).status_code == 401
     assert client.post("/v1/auth/login", json={"username": "nobody", "password": PASSWORD}).status_code == 401
     token = as_user(client, "asha")
-    assert client.get("/v1/auth/me", headers=token).json() == {"username": "asha", "role": "ANALYST"}
+    assert client.get("/v1/auth/me", headers=token).json() == {
+        "username": "asha", "role": "ANALYST", "org_id": "demo", "org_name": "Demo Bank"}
     assert client.get("/v1/auth/me", headers=KEY).status_code == 403  # an API key is not a person
     assert client.post("/v1/auth/logout", headers=token).status_code == 204
     assert client.get("/v1/auth/me", headers=token).status_code == 401
@@ -420,12 +479,13 @@ def test_roles_limit_what_each_caller_can_do(client):
     assert client.patch("/v1/alerts/7", json=update, headers=viewer).status_code == 403
     assert client.patch("/v1/alerts/7", json=update, headers=KEY).status_code == 403
     assert client.patch("/v1/alerts/7", json=update, headers=analyst).status_code == 200
-    # Settings, imports, users and the audit log are admin only.
+    # Users and the audit log are admin only. Settings apply to every organisation, so only the superadmin.
     for who in (viewer, analyst, KEY):
         assert client.put("/v1/config", json=cfg, headers=who).status_code == 403
         assert client.get("/v1/users", headers=who).status_code == 403
         assert client.get("/v1/audit", headers=who).status_code == 403
-    assert client.put("/v1/config", json=cfg, headers=admin).status_code == 200
+    assert client.put("/v1/config", json=cfg, headers=admin).status_code == 403
+    assert client.put("/v1/config", json=cfg, headers=as_user(client, "root")).status_code == 200
     # People below admin cannot push transactions; machines with a key can.
     assert client.post("/v1/transactions", json=EVENT, headers=analyst).status_code == 403
     assert client.post("/v1/transactions", json=EVENT, headers=KEY).status_code == 202

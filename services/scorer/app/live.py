@@ -26,24 +26,38 @@ from .metrics import SSE_CLIENTS
 log = logging.getLogger("live")
 
 
+ALL = "*"   # a superadmin's stream: every organisation
+
+
 class Hub:
-    """Fan-out to connected SSE clients. Slow clients are dropped, never buffered forever."""
+    """Fan-out to connected SSE clients. Slow clients are dropped, never buffered forever.
+
+    Each client sees one organisation (or ALL). An event carrying `org_id` goes only to
+    clients of that organisation and to ALL; an event without one (status) goes to everyone.
+    """
 
     def __init__(self) -> None:
-        self.clients: set[asyncio.Queue] = set()
+        self.clients: dict[asyncio.Queue, str] = {}
 
-    def subscribe(self) -> asyncio.Queue:
+    def subscribe(self, org: str = ALL) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=2000)
-        self.clients.add(q)
+        self.clients[q] = org
         SSE_CLIENTS.set(len(self.clients))
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
-        self.clients.discard(q)
+        self.clients.pop(q, None)
         SSE_CLIENTS.set(len(self.clients))
 
-    def publish(self, event: str, data: dict) -> None:
-        for q in list(self.clients):
+    def orgs(self) -> set[str]:
+        return set(self.clients.values())
+
+    def publish(self, event: str, data: dict, org: str | None = None) -> None:
+        """`org` (or data["org_id"]) limits who receives it; ALL means only superadmin streams."""
+        target = org if org is not None else data.get("org_id")
+        for q, client_org in list(self.clients.items()):
+            if target is not None and client_org != target and client_org != ALL:
+                continue
             try:
                 q.put_nowait((event, data))
             except asyncio.QueueFull:
@@ -66,7 +80,8 @@ class LiveState:
         self.last_inference_at: datetime | None = None
         self.push_ms: deque[float] = deque(maxlen=2000)  # persisted -> handed to SSE clients
         self.dirty = True
-        self.latest_stats: dict | None = None
+        self.latest_stats: dict | None = None        # every organisation together
+        self.org_stats: dict[str, dict] = {}         # per organisation with a dashboard open
         self.scorer: dict | None = None
         self.nodes: list[dict] | None = None
         self.node = nodes.node_id()
@@ -230,13 +245,13 @@ class LiveState:
             return
         if st["stream_status"] == "DISCONNECTED":
             notify.send(self.redis, url, "disconnected",
-                        "VYROX: stream DISCONNECTED: " + "; ".join(st["reasons"]))
+                        "Foresentry: stream DISCONNECTED: " + "; ".join(st["reasons"]))
         cutoff = time.time() - 600
         for n in st["nodes"]:
             # Only nodes that stopped recently: an old, deliberately removed node is not news.
             if not n["alive"] and datetime.fromisoformat(n["last_seen"]).timestamp() > cutoff:
                 notify.send(self.redis, url, f"down:{n['kind']}:{n['id']}",
-                            f"VYROX: {n['kind']} node {n['id']} stopped reporting at {n['last_seen']}")
+                            f"Foresentry: {n['kind']} node {n['id']} stopped reporting at {n['last_seen']}")
 
     async def _stats_loop(self) -> None:
         while True:
@@ -246,9 +261,16 @@ class LiveState:
                 self.dirty = False
                 try:
                     stats = await asyncio.to_thread(self.repo.stats)
-                    stats["performance"] = await asyncio.to_thread(self.performance)
+                    perf = await asyncio.to_thread(self.performance)
+                    stats["performance"] = perf
                     self.latest_stats = stats
-                    self.hub.publish("stats", stats)
+                    self.hub.publish("stats", stats, org=ALL)
+                    # Each organisation's dashboards get figures for that organisation only.
+                    for org in self.hub.orgs() - {ALL}:
+                        org_stats = await asyncio.to_thread(self.repo.stats, None, org)
+                        org_stats["performance"] = perf
+                        self.org_stats[org] = org_stats
+                        self.hub.publish("stats", org_stats, org=org)
                 except Exception as exc:  # noqa: BLE001 - keep the loop alive; status shows the outage
                     log.error("stats refresh failed", extra={"error": str(exc)[:200]})
             await asyncio.sleep(2)

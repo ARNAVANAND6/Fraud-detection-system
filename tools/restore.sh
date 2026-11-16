@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Restore a VYROX backup into a new database.
+# Restore a Foresentry backup into a new database.
 #   tools/restore.sh <backup.dump> <target-database>
 # The target database is created here and must not already exist: this script
 # never overwrites a database. To replace the live one, restore to a new name,

@@ -3,7 +3,8 @@
 // Env: DASHBOARD_URL, API_URL, API_KEY, DASH_USER, DASH_PASSWORD, SCORER_STOP_CMD, SCORER_START_CMD, API_STOP_CMD, API_START_CMD
 const { chromium } = require("playwright");
 const { execSync, spawn } = require("child_process");
-const DASH = process.env.DASHBOARD_URL || "http://localhost:3000";
+// The console lives at /console; / is the public home page.
+const DASH = process.env.DASHBOARD_URL || "http://localhost:3000/console";
 const API = process.env.API_URL || "http://localhost:8000";
 const KEY = process.env.API_KEY || "dev-key";
 const USER = process.env.DASH_USER || "admin";

@@ -1,6 +1,6 @@
 # Security overview
 
-What VYROX does today to protect data and access, and what it does not do.
+What Foresentry does today to protect data and access, and what it does not do.
 Every "does" below is implemented in this repository and covered by a test or
 a recorded check. Nothing here is a certification.
 
@@ -8,11 +8,22 @@ a recorded check. Nothing here is a certification.
 
 | Caller | Authenticates with | May do |
 |---|---|---|
-| Viewer | username and password | read |
-| Analyst | username and password | read, work alerts |
-| Admin | username and password | everything, including settings, imports, people and the audit log |
-| Machine | `X-API-Key` header | send transactions, dry-run scores, read. Nothing else |
+| Superadmin | username and password | all organisations: create, suspend, reactivate; risk settings (global) |
+| Admin | username and password | inside one organisation: imports, people, API keys, audit log |
+| Analyst | username and password | read one organisation, work its alerts |
+| Viewer | username and password | read one organisation |
+| Customer | username and password | the payments on accounts linked to them; report a payment. No scores |
+| Machine | `X-API-Key` header | send transactions, dry-run scores, read one organisation. Nothing else |
 
+- **Organisations.** Every stored row carries `org_id`, and every query for a person or key is filtered by
+  their organisation in the API (`tenancy.scope`). Asking for another organisation's data returns 403, or
+  404 for a single record. Only the superadmin may read across organisations. Separation is in application
+  code over one shared database: there is no PostgreSQL row-level security and no database per organisation.
+- **API keys** made in the console are 256-bit random, shown once and stored as SHA-256 digests. Each
+  belongs to one organisation, which every payment it sends is stamped with, whatever the body says.
+  Revoking a key or suspending its organisation stops it on the next request.
+- Nobody can be promoted to superadmin. Only a superadmin can create another, and the last one cannot be
+  removed or deactivated.
 - Passwords: salted scrypt hashes (n = 2^14), minimum 10 characters. Plain passwords are never stored or logged.
 - Lock-out: five failed sign-ins for one username from one address block that pair for 15 minutes. The count is
   kept in Redis (under a digest, not the username), so it holds across API replicas and restarts.
@@ -30,7 +41,8 @@ a recorded check. Nothing here is a certification.
   required. People are matched by the provider's subject id, or by an e-mail an administrator set on their
   account. Unknown people are refused unless their e-mail domain is in `OIDC_ALLOWED_DOMAINS`. Two-factor
   sign-in for SSO users is enforced at the identity provider.
-- Production refuses to start with the demo API key, demo webhook secret or demo administrator password.
+- Production refuses to start with the demo API key, demo webhook secret, demo administrator password or
+  demo superadmin password (`SUPERADMIN_PASSWORD`).
 
 ## Audit
 
@@ -69,6 +81,7 @@ These are the items a bank's security review will ask for and will not find:
 - Encryption at rest. Use encrypted disks or a managed database; backups are not encrypted by the script.
 - Tamper-evident audit log. A database administrator can still change `audit_log`.
 - Field-level masking or tokenisation of account identifiers.
+- Database-enforced separation of organisations (row-level security, or a database per organisation).
 - TLS and authentication between the internal services (Kafka, Redis, PostgreSQL).
 - An independent penetration test, and any certification or attestation: ISO 27001, SOC 2, PCI DSS.
 - A data-protection assessment under India's DPDP Act, and RBI outsourcing and data-localisation requirements.

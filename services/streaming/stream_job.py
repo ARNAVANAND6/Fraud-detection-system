@@ -61,6 +61,7 @@ EVENT_SCHEMA = T.StructType([
     T.StructField("device_id", T.StringType()),
     T.StructField("source", T.StringType()),
     T.StructField("ingested_at", T.StringType()),
+    T.StructField("org_id", T.StringType()),
 ])
 SOURCES = ["LIVE_API", "LIVE_WEBHOOK", "KAFKA_STREAM", "HISTORICAL_IMPORT", "SIMULATED_DEMO"]
 TXN_TYPES = ["PAYMENT", "TRANSFER", "CASH_OUT", "CASH_IN", "DEBIT"]

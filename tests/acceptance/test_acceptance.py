@@ -1,7 +1,7 @@
-"""The ten VYROX acceptance tests, run against the real running stack
+"""The ten Foresentry acceptance tests, run against the real running stack
 (Kafka, Spark or direct mode, Redis, PostgreSQL, scorer, API). Nothing is mocked.
 
-    VYROX_ACCEPTANCE=1 pytest tests/acceptance -v
+    FORESENTRY_ACCEPTANCE=1 pytest tests/acceptance -v
 
 The suite stops and starts the scoring service to test disconnection. By
 default it does that with docker compose; override for a host-run scorer:
@@ -24,8 +24,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-if not os.environ.get("VYROX_ACCEPTANCE"):
-    pytest.skip("needs the running stack; set VYROX_ACCEPTANCE=1", allow_module_level=True)
+if not os.environ.get("FORESENTRY_ACCEPTANCE"):
+    pytest.skip("needs the running stack; set FORESENTRY_ACCEPTANCE=1", allow_module_level=True)
 
 import httpx
 import psycopg
@@ -167,7 +167,7 @@ def scorer(cmd: str, background: bool = False) -> None:
 def test_00_stack_is_up_and_labelled():
     r = httpx.get(f"{API}/health/ready", timeout=10)
     assert r.status_code == 200, r.text
-    assert r.headers["X-Vyrox-Environment"] == S.environment
+    assert r.headers["X-Foresentry-Environment"] == S.environment
     st = status()
     assert st["environment"] == S.environment and st["stream_status"] in ("LIVE", "IDLE"), st
     RESULTS["pipeline_mode"] = st["pipeline_mode"]
@@ -275,7 +275,7 @@ def test_09_duplicates_create_no_duplicate_transactions_or_alerts():
     ts = str(int(time.time()))
     sig = hmac.new(S.webhook_secret.encode(), ts.encode() + b"." + body, hashlib.sha256).hexdigest()
     r = httpx.post(f"{API}/v1/webhooks/generic", content=body, timeout=20,
-                   headers={"X-Vyrox-Timestamp": ts, "X-Vyrox-Signature": sig})    # same payment via webhook
+                   headers={"X-Foresentry-Timestamp": ts, "X-Foresentry-Signature": sig})    # same payment via webhook
     assert r.status_code == 202 and r.json()["status"] == "duplicate", r.text
     wait_for(lambda: prediction(tid), what="prediction row")
     # Bypass the gateway entirely: the same record delivered twice more on Kafka itself.

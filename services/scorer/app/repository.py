@@ -28,6 +28,10 @@ class InvalidTransition(Exception):
     pass
 
 
+def _org(event: TransactionEvent) -> str:
+    return event.org_id or "demo"
+
+
 def _json_safe(features: dict) -> dict:
     """PostgreSQL JSON has no NaN: a missing feature (unknown balance) is stored as null."""
     return {k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in features.items()}
@@ -46,62 +50,88 @@ class Repository:
             return c.execute("SELECT 1 AS ok").fetchone()["ok"] == 1
 
     # ---- users, sessions, audit ------------------------------------------------
-    def ensure_auth(self, admin_username: str, admin_password_hash: str) -> None:
-        """Create the auth tables if missing (older databases predate them) and the first admin."""
+    def ensure_schema(self, c=None) -> None:
+        """Bring an older database up to date: auth tables, organisations. Safe to run at every start."""
         from .auth import AUTH_SCHEMA
+        from .tenancy import TENANCY_SCHEMA
 
+        if c is None:
+            with self.pool.connection() as conn, conn.transaction():
+                return self.ensure_schema(conn)
+        # API and scorer replicas can start at once; one at a time changes the schema.
+        c.execute("SELECT pg_advisory_xact_lock(7461)")
+        c.execute(AUTH_SCHEMA)
+        c.execute(TENANCY_SCHEMA)
+
+    def ensure_auth(self, admin_username: str, admin_password_hash: str,
+                    superadmin_username: str | None = None, superadmin_password_hash: str | None = None) -> None:
+        """Schema, the demo organisation's first admin, and the platform's first superadmin."""
         with self.pool.connection() as c, c.transaction():
-            # Several API replicas can start at once; one at a time changes the schema.
-            c.execute("SELECT pg_advisory_xact_lock(7461)")
-            c.execute(AUTH_SCHEMA)
-            c.execute("INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'ADMIN') "
+            self.ensure_schema(c)
+            c.execute("INSERT INTO users (username, password_hash, role, org_id) VALUES (%s, %s, 'ADMIN', 'demo') "
                       "ON CONFLICT (username) DO NOTHING", (admin_username, admin_password_hash))
+            if superadmin_username and superadmin_password_hash:
+                c.execute("INSERT INTO users (username, password_hash, role, org_id) "
+                          "VALUES (%s, %s, 'SUPERADMIN', NULL) ON CONFLICT (username) DO NOTHING",
+                          (superadmin_username, superadmin_password_hash))
             c.execute("DELETE FROM sessions WHERE expires_at < now()")
 
     def get_user(self, username: str) -> dict | None:
         with self.pool.connection() as c:
             return c.execute("SELECT * FROM users WHERE username = %s", (username,)).fetchone()
 
-    def list_users(self) -> list[dict]:
-        with self.pool.connection() as c:
-            return c.execute(
-                """SELECT username, role, active, email, mfa_enabled, sso_subject IS NOT NULL AS sso,
-                          created_at, updated_at FROM users ORDER BY username""").fetchall()
+    USER_COLUMNS = """username, role, org_id, account_ids, active, email, mfa_enabled,
+                      sso_subject IS NOT NULL AS sso, created_at, updated_at"""
 
-    def create_user(self, username: str, password_hash: str, role: str, email: str | None = None) -> bool:
+    def list_users(self, org: str | None = None) -> list[dict]:
+        with self.pool.connection() as c:
+            if org:
+                return c.execute(f"SELECT {self.USER_COLUMNS} FROM users WHERE org_id = %s ORDER BY username",
+                                 (org,)).fetchall()
+            return c.execute(f"SELECT {self.USER_COLUMNS} FROM users ORDER BY org_id NULLS FIRST, username").fetchall()
+
+    def create_user(self, username: str, password_hash: str, role: str, email: str | None = None,
+                    org_id: str | None = "demo", account_ids: list[str] | tuple = ()) -> bool:
         with self.pool.connection() as c:
             try:
-                cur = c.execute("INSERT INTO users (username, password_hash, role, email) VALUES (%s, %s, %s, %s) "
-                                "ON CONFLICT (username) DO NOTHING", (username, password_hash, role, email))
+                cur = c.execute("INSERT INTO users (username, password_hash, role, email, org_id, account_ids) "
+                                "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (username) DO NOTHING",
+                                (username, password_hash, role, email, None if role == "SUPERADMIN" else org_id,
+                                 list(account_ids)))
             except psycopg.errors.UniqueViolation:
                 return False   # e-mail already used by another account
             return cur.rowcount == 1
 
     def update_user(self, username: str, role: str | None, active: bool | None,
-                    password_hash: str | None, reset_mfa: bool = False, email: str | None = None) -> dict | None:
-        """Change a user. Refuses to leave the system without an active admin."""
+                    password_hash: str | None, reset_mfa: bool = False, email: str | None = None,
+                    org: str | None = None, account_ids: list[str] | None = None) -> dict | None:
+        """Change a user (only within `org` when given). Refuses to leave an organisation, or the
+        platform, without an active administrator."""
         with self.pool.connection() as c, c.transaction():
             cur = c.execute("SELECT * FROM users WHERE username = %s FOR UPDATE", (username,)).fetchone()
-            if cur is None:
+            if cur is None or (org and cur["org_id"] != org):
                 return None
-            loses_admin = cur["role"] == "ADMIN" and cur["active"] and (
-                (role is not None and role != "ADMIN") or active is False)
-            if loses_admin:
-                others = c.execute("SELECT count(*) AS n FROM users WHERE role = 'ADMIN' AND active AND username <> %s",
-                                   (username,)).fetchone()["n"]
-                if others == 0:
-                    raise ValueError("this is the last active administrator")
+            for top in ("ADMIN", "SUPERADMIN"):
+                loses = cur["role"] == top and cur["active"] and ((role is not None and role != top) or active is False)
+                if loses:
+                    others = c.execute(
+                        """SELECT count(*) AS n FROM users WHERE role = %s AND active AND username <> %s
+                           AND org_id IS NOT DISTINCT FROM %s""", (top, username, cur["org_id"])).fetchone()["n"]
+                    if others == 0:
+                        raise ValueError("this is the last active administrator" if top == "ADMIN"
+                                         else "this is the last active superadmin")
             row = c.execute(
-                """UPDATE users SET role = coalesce(%s, role), active = coalesce(%s, active),
+                f"""UPDATE users SET role = coalesce(%s, role), active = coalesce(%s, active),
                        password_hash = coalesce(%s, password_hash), email = coalesce(%s, email),
+                       account_ids = coalesce(%s, account_ids),
                        mfa_enabled = mfa_enabled AND NOT %s,
                        mfa_secret = CASE WHEN %s THEN NULL ELSE mfa_secret END,
-                       mfa_recovery = CASE WHEN %s THEN '{}' ELSE mfa_recovery END,
+                       mfa_recovery = CASE WHEN %s THEN '{{}}' ELSE mfa_recovery END,
                        updated_at = now()
                    WHERE username = %s
-                   RETURNING username, role, active, email, mfa_enabled, sso_subject IS NOT NULL AS sso,
-                             created_at, updated_at""",
-                (role, active, password_hash, email, reset_mfa, reset_mfa, reset_mfa, username)).fetchone()
+                   RETURNING {self.USER_COLUMNS}""",
+                (role, active, password_hash, email, account_ids, reset_mfa, reset_mfa, reset_mfa,
+                 username)).fetchone()
             if (active is False or password_hash is not None or reset_mfa
                     or (role is not None and role != cur["role"])):
                 c.execute("DELETE FROM sessions WHERE username = %s", (username,))  # sign them out everywhere
@@ -191,21 +221,94 @@ class Repository:
     def get_session_user(self, token_sha256: str) -> dict | None:
         with self.pool.connection() as c:
             return c.execute(
-                """SELECT u.username, u.role, s.limited FROM sessions s JOIN users u USING (username)
+                """SELECT u.username, u.role, u.org_id, u.account_ids, s.limited, o.status AS org_status
+                   FROM sessions s JOIN users u USING (username)
+                   LEFT JOIN organisations o ON o.org_id = u.org_id
                    WHERE s.token_sha256 = %s AND s.expires_at > now() AND u.active""", (token_sha256,)).fetchone()
 
     def delete_session(self, token_sha256: str) -> None:
         with self.pool.connection() as c:
             c.execute("DELETE FROM sessions WHERE token_sha256 = %s", (token_sha256,))
 
-    def audit(self, actor: str, role: str, action: str, target: str | None, detail: dict, ip: str | None) -> None:
+    def audit(self, actor: str, role: str, action: str, target: str | None, detail: dict, ip: str | None,
+              org_id: str | None = None) -> None:
         with self.pool.connection() as c:
-            c.execute("INSERT INTO audit_log (actor, role, action, target, detail, ip) VALUES (%s,%s,%s,%s,%s,%s)",
-                      (actor, role, action, target, Jsonb(detail), ip))
+            c.execute("INSERT INTO audit_log (actor, role, action, target, detail, ip, org_id) "
+                      "VALUES (%s,%s,%s,%s,%s,%s,%s)", (actor, role, action, target, Jsonb(detail), ip, org_id))
 
-    def list_audit(self, limit: int) -> list[dict]:
+    def list_audit(self, limit: int, org: str | None = None) -> list[dict]:
         with self.pool.connection() as c:
+            if org:
+                return c.execute("SELECT * FROM audit_log WHERE org_id = %s ORDER BY id DESC LIMIT %s",
+                                 (org, limit)).fetchall()
             return c.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT %s", (limit,)).fetchall()
+
+    # ---- organisations and their API keys ----------------------------------------
+    def get_org(self, org_id: str) -> dict | None:
+        with self.pool.connection() as c:
+            return c.execute("SELECT * FROM organisations WHERE org_id = %s", (org_id,)).fetchone()
+
+    def org_active(self, org_id: str) -> bool:
+        with self.pool.connection() as c:
+            row = c.execute("SELECT status FROM organisations WHERE org_id = %s", (org_id,)).fetchone()
+        return bool(row) and row["status"] == "ACTIVE"
+
+    def list_orgs(self) -> list[dict]:
+        """Every organisation with its usage, measured from stored rows."""
+        with self.pool.connection() as c:
+            return c.execute(
+                """SELECT o.org_id, o.name, o.region, o.status, o.created_at,
+                          (SELECT count(*) FROM users u WHERE u.org_id = o.org_id) AS users,
+                          (SELECT count(*) FROM predictions p WHERE p.org_id = o.org_id
+                             AND p.persisted_at > now() - interval '24 hours') AS transactions_24h,
+                          (SELECT count(*) FROM alerts a WHERE a.org_id = o.org_id
+                             AND a.status IN ('OPEN', 'IN_REVIEW')) AS open_alerts,
+                          (SELECT max(persisted_at) FROM predictions p WHERE p.org_id = o.org_id) AS last_event_at
+                   FROM organisations o ORDER BY o.created_at""").fetchall()
+
+    def create_org(self, org_id: str, name: str, region: str) -> dict | None:
+        with self.pool.connection() as c:
+            return c.execute("INSERT INTO organisations (org_id, name, region) VALUES (%s, %s, %s) "
+                             "ON CONFLICT DO NOTHING RETURNING *", (org_id, name, region)).fetchone()
+
+    def update_org(self, org_id: str, name: str | None, region: str | None, status: str | None) -> dict | None:
+        with self.pool.connection() as c, c.transaction():
+            row = c.execute(
+                """UPDATE organisations SET name = coalesce(%s, name), region = coalesce(%s, region),
+                       status = coalesce(%s, status), updated_at = now() WHERE org_id = %s RETURNING *""",
+                (name, region, status, org_id)).fetchone()
+            if row and status == "SUSPENDED":   # sign everyone in it out now
+                c.execute("DELETE FROM sessions WHERE username IN (SELECT username FROM users WHERE org_id = %s)",
+                          (org_id,))
+            return row
+
+    def find_api_key(self, key_sha256: str) -> dict | None:
+        with self.pool.connection() as c:
+            return c.execute(
+                """UPDATE api_keys k SET last_used_at = now() FROM organisations o
+                   WHERE k.key_sha256 = %s AND k.revoked_at IS NULL AND o.org_id = k.org_id
+                   RETURNING k.org_id, k.prefix, o.status AS org_status""", (key_sha256,)).fetchone()
+
+    def create_api_key(self, key_sha256: str, org_id: str, name: str, prefix: str, created_by: str) -> dict:
+        with self.pool.connection() as c:
+            return c.execute(
+                """INSERT INTO api_keys (key_sha256, org_id, name, prefix, created_by) VALUES (%s,%s,%s,%s,%s)
+                   RETURNING left(key_sha256, 12) AS key_id, org_id, name, prefix, created_by, created_at""",
+                (key_sha256, org_id, name, prefix, created_by)).fetchone()
+
+    def list_api_keys(self, org: str | None) -> list[dict]:
+        with self.pool.connection() as c:
+            return c.execute(
+                """SELECT left(key_sha256, 12) AS key_id, org_id, name, prefix, created_by, created_at,
+                          last_used_at, revoked_at FROM api_keys
+                   WHERE %s::text IS NULL OR org_id = %s ORDER BY created_at DESC""", (org, org)).fetchall()
+
+    def revoke_api_key(self, key_id: str, org: str | None) -> bool:
+        with self.pool.connection() as c:
+            cur = c.execute(
+                """UPDATE api_keys SET revoked_at = now() WHERE left(key_sha256, 12) = %s AND revoked_at IS NULL
+                   AND (%s::text IS NULL OR org_id = %s)""", (key_id, org, org))
+            return cur.rowcount == 1
 
     # ---- policy ---------------------------------------------------------------
     def get_policy(self) -> Policy:
@@ -238,14 +341,14 @@ class Repository:
         """
         with self.pool.connection() as c, c.transaction():
             row = c.execute(
-                """INSERT INTO predictions (transaction_id, source, account_id, counterparty_id, txn_type,
+                """INSERT INTO predictions (org_id, transaction_id, source, account_id, counterparty_id, txn_type,
                        amount, region, event_time, ingested_at, scored_at, risk_score, risk_level, decision,
                        reason_codes, model_version, features, feature_ms, inference_ms, pipeline_ms)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                            extract(epoch FROM clock_timestamp() - %s::timestamptz) * 1000)
-                   ON CONFLICT (transaction_id) DO NOTHING
+                   ON CONFLICT (org_id, transaction_id) DO NOTHING
                    RETURNING persisted_at, pipeline_ms""",
-                (event.transaction_id, source.value, event.account_id, event.counterparty_id,
+                (_org(event), event.transaction_id, source.value, event.account_id, event.counterparty_id,
                  event.txn_type.value, event.amount, event.region, event.event_time, ingested_at,
                  score.scored_at, score.risk_score, score.risk_level.value, score.decision.value,
                  score.reason_codes, score.model_version, json.dumps(_json_safe(features)), feature_ms,
@@ -263,13 +366,14 @@ class Repository:
         priority = alert_priority(score.risk_level, triggers)
         # Serialise alert handling per account, so two events for one account
         # can never both decide "no open alert yet".
-        c.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (event.account_id,))
+        org = _org(event)
+        c.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"{org}|{event.account_id}",))
         existing = c.execute(
             """SELECT alert_id, priority, event_count FROM alerts
-               WHERE account_id = %s AND status IN ('OPEN', 'IN_REVIEW')
+               WHERE org_id = %s AND account_id = %s AND status IN ('OPEN', 'IN_REVIEW')
                  AND last_event_at > clock_timestamp() - make_interval(mins => %s)
                ORDER BY created_at DESC LIMIT 1 FOR UPDATE""",
-            (event.account_id, ap.dedup_minutes)).fetchone()
+            (org, event.account_id, ap.dedup_minutes)).fetchone()
         if existing:
             # Deduplicate: attach to the open alert; repeated activity raises its priority.
             new_priority = min(existing["priority"], priority)
@@ -290,19 +394,20 @@ class Repository:
             assignee = c.execute(
                 """SELECT a.name FROM unnest(%s::text[]) WITH ORDINALITY AS a(name, ord)
                    LEFT JOIN alerts al ON al.assigned_to = a.name AND al.status IN ('OPEN', 'IN_REVIEW')
+                       AND al.org_id = %s
                    GROUP BY a.name, a.ord ORDER BY count(al.alert_id), a.ord LIMIT 1""",
-                (ap.analysts,)).fetchone()
+                (ap.analysts, org)).fetchone()
             alert = c.execute(
-                """INSERT INTO alerts (account_id, first_transaction, priority, trigger_types, reason_codes,
+                """INSERT INTO alerts (org_id, account_id, first_transaction, priority, trigger_types, reason_codes,
                        max_risk_score, total_amount, assigned_to, sla_due_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s, clock_timestamp() + make_interval(secs => %s))
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, clock_timestamp() + make_interval(secs => %s))
                    RETURNING *""",
-                (event.account_id, event.transaction_id, priority, triggers, score.reason_codes,
+                (org, event.account_id, event.transaction_id, priority, triggers, score.reason_codes,
                  score.risk_score, event.amount, assignee["name"] if assignee else None,
                  60 * ap.sla_minutes.get(str(priority), 60))).fetchone()
             kind = "CREATED"
-        c.execute("INSERT INTO alert_transactions (transaction_id, alert_id, trigger_types) VALUES (%s,%s,%s)",
-                  (event.transaction_id, alert["alert_id"], triggers))
+        c.execute("INSERT INTO alert_transactions (org_id, transaction_id, alert_id, trigger_types) "
+                  "VALUES (%s,%s,%s,%s)", (org, event.transaction_id, alert["alert_id"], triggers))
         c.execute("INSERT INTO alert_events (alert_id, kind, detail, actor) VALUES (%s,%s,%s,'alert-engine')",
                   (alert["alert_id"], kind, Jsonb({"transaction_id": event.transaction_id, "triggers": triggers,
                                                    "risk_score": score.risk_score})))
@@ -334,49 +439,56 @@ class Repository:
                 (ap.supervisor, json.dumps(ap.sla_minutes), ap.max_escalations, ap.supervisor)).fetchall()
         return rows
 
-    def save_label(self, transaction_id: str, is_fraud: bool, source: str) -> None:
+    def save_label(self, transaction_id: str, is_fraud: bool, source: str, org_id: str = "demo") -> None:
         with self.pool.connection() as c:
             c.execute(
-                """INSERT INTO labels (transaction_id, is_fraud, source) VALUES (%s,%s,%s)
-                   ON CONFLICT (transaction_id) DO UPDATE
+                """INSERT INTO labels (org_id, transaction_id, is_fraud, source) VALUES (%s,%s,%s,%s)
+                   ON CONFLICT (org_id, transaction_id) DO UPDATE
                    SET is_fraud = EXCLUDED.is_fraud, source = EXCLUDED.source, labelled_at = now()
                    WHERE labels.source <> 'ANALYST' OR EXCLUDED.source = 'ANALYST'""",
-                (transaction_id, is_fraud, source))
+                (org_id, transaction_id, is_fraud, source))
 
     # ---- case management --------------------------------------------------------
-    def list_alerts(self, status: str | None, limit: int) -> list[dict]:
+    def list_alerts(self, status: str | None, limit: int, org: str | None = None) -> list[dict]:
         with self.pool.connection() as c:
             q = """SELECT a.*, p.source, p.txn_type, p.amount AS first_amount,
                           a.sla_due_at < clock_timestamp() AND a.status = 'OPEN' AS sla_breached
-                   FROM alerts a JOIN predictions p ON p.transaction_id = a.first_transaction"""
+                   FROM alerts a JOIN predictions p ON p.org_id = a.org_id AND p.transaction_id = a.first_transaction
+                   WHERE TRUE"""
             params: list = []
+            if org:
+                q += " AND a.org_id = %s"
+                params.append(org)
             if status:
-                q += " WHERE a.status = %s"
+                q += " AND a.status = %s"
                 params.append(status)
             q += " ORDER BY a.priority, a.created_at DESC LIMIT %s"
             params.append(limit)
             return c.execute(q, params).fetchall()
 
-    def get_alert(self, alert_id: int) -> dict | None:
+    def get_alert(self, alert_id: int, org: str | None = None) -> dict | None:
         with self.pool.connection() as c:
             alert = c.execute("SELECT * FROM alerts WHERE alert_id = %s", (alert_id,)).fetchone()
-            if alert is None:
+            if alert is None or (org and alert["org_id"] != org):
                 return None
             alert["transactions"] = c.execute(
                 """SELECT p.transaction_id, p.source, p.txn_type, p.amount, p.counterparty_id, p.event_time,
                           p.risk_score, p.risk_level, p.reason_codes, t.trigger_types
-                   FROM alert_transactions t JOIN predictions p USING (transaction_id)
+                   FROM alert_transactions t JOIN predictions p USING (org_id, transaction_id)
                    WHERE t.alert_id = %s ORDER BY p.persisted_at DESC LIMIT 100""", (alert_id,)).fetchall()
+            alert["customer_reports"] = c.execute(
+                """SELECT report_id, transaction_id, kind, note, username, created_at FROM customer_reports
+                   WHERE alert_id = %s ORDER BY report_id DESC""", (alert_id,)).fetchall()
             alert["events"] = c.execute(
                 "SELECT kind, detail, actor, at FROM alert_events WHERE alert_id = %s ORDER BY id DESC LIMIT 100",
                 (alert_id,)).fetchall()
             return alert
 
     def update_alert(self, alert_id: int, to_status: str | None, assign_to: str | None, actor: str,
-                     notes: str | None) -> dict:
+                     notes: str | None, org: str | None = None) -> dict:
         with self.pool.connection() as c, c.transaction():
             cur = c.execute("SELECT * FROM alerts WHERE alert_id = %s FOR UPDATE", (alert_id,)).fetchone()
-            if cur is None:
+            if cur is None or (org and cur["org_id"] != org):
                 raise KeyError(alert_id)
             if to_status and to_status != cur["status"] and to_status not in TRANSITIONS[cur["status"]]:
                 raise InvalidTransition(f"{cur['status']} -> {to_status} is not allowed")
@@ -394,28 +506,37 @@ class Repository:
             if to_status in ("CONFIRMED_FRAUD", "FALSE_POSITIVE"):
                 # The analyst's verdict becomes the label for every transaction in the alert.
                 c.execute(
-                    """INSERT INTO labels (transaction_id, is_fraud, source)
-                       SELECT transaction_id, %s, 'ANALYST' FROM alert_transactions WHERE alert_id = %s
-                       ON CONFLICT (transaction_id) DO UPDATE SET is_fraud = EXCLUDED.is_fraud,
+                    """INSERT INTO labels (org_id, transaction_id, is_fraud, source)
+                       SELECT org_id, transaction_id, %s, 'ANALYST' FROM alert_transactions WHERE alert_id = %s
+                       ON CONFLICT (org_id, transaction_id) DO UPDATE SET is_fraud = EXCLUDED.is_fraud,
                            source = 'ANALYST', labelled_at = now()""",
                     (to_status == "CONFIRMED_FRAUD", alert_id))
         return row
 
-    def get_transaction(self, transaction_id: str) -> dict | None:
+    def get_transaction(self, transaction_id: str, org: str | None = None) -> dict | None:
+        """One transaction. Without `org` (superadmin) the id may exist in several organisations:
+        the most recent is returned."""
         with self.pool.connection() as c:
             return c.execute(
                 """SELECT p.*, t.alert_id, a.status AS alert_status, a.priority AS alert_priority,
                           l.is_fraud AS label, l.source AS label_source
-                   FROM predictions p LEFT JOIN alert_transactions t USING (transaction_id)
-                   LEFT JOIN alerts a USING (alert_id) LEFT JOIN labels l USING (transaction_id)
-                   WHERE p.transaction_id = %s""", (transaction_id,)).fetchone()
+                   FROM predictions p
+                   LEFT JOIN alert_transactions t ON t.org_id = p.org_id AND t.transaction_id = p.transaction_id
+                   LEFT JOIN alerts a ON a.alert_id = t.alert_id
+                   LEFT JOIN labels l ON l.org_id = p.org_id AND l.transaction_id = p.transaction_id
+                   WHERE p.transaction_id = %s AND (%s::text IS NULL OR p.org_id = %s)
+                   ORDER BY p.persisted_at DESC LIMIT 1""", (transaction_id, org, org)).fetchone()
 
-    FEED_COLUMNS = """transaction_id, source, account_id, counterparty_id, txn_type, amount, region, event_time,
+    FEED_COLUMNS = """org_id, transaction_id, source, account_id, counterparty_id, txn_type, amount, region, event_time,
                       ingested_at, scored_at, persisted_at, risk_score, risk_level, decision, reason_codes,
                       model_version, inference_ms, pipeline_ms"""
 
-    def recent_transactions(self, limit: int, suspicious_only: bool = False, source: str | None = None) -> list[dict]:
+    def recent_transactions(self, limit: int, suspicious_only: bool = False, source: str | None = None,
+                            org: str | None = None) -> list[dict]:
         where, params = [], []
+        if org:
+            where.append("org_id = %s")
+            params.append(org)
         if suspicious_only:
             where.append("risk_level IN ('HIGH', 'CRITICAL')")
         if source:
@@ -435,9 +556,17 @@ class Repository:
             ).fetchone()
 
     # ---- analytics, all computed from stored rows -----------------------------------
-    def stats(self, source: str | None = None) -> dict:
-        f, params = ("WHERE source = %s", [source]) if source else ("", [])
-        and_f = f.replace("WHERE", "AND")
+    def stats(self, source: str | None = None, org: str | None = None) -> dict:
+        conds, params = [], []
+        if source:
+            conds.append("source = %s")
+            params.append(source)
+        if org:
+            conds.append("org_id = %s")
+            params.append(org)
+        f = ("WHERE " + " AND ".join(conds)) if conds else ""
+        and_f = ("AND " + " AND ".join(conds)) if conds else ""
+        org_f, org_p = ("WHERE org_id = %s", [org]) if org else ("", [])
         with self.pool.connection() as c:
             totals = c.execute(
                 f"""SELECT count(*) AS processed, coalesce(sum(amount), 0)::float AS total_volume,
@@ -461,30 +590,32 @@ class Repository:
                     FROM predictions WHERE persisted_at > clock_timestamp() - interval '30 minutes' {and_f}
                     GROUP BY 1 ORDER BY 1""", params).fetchall()
             sources = c.execute(
-                """SELECT source, count(*) AS txns, coalesce(sum(amount), 0)::float AS volume,
+                f"""SELECT source, count(*) AS txns, coalesce(sum(amount), 0)::float AS volume,
                           count(*) FILTER (WHERE risk_level IN ('HIGH', 'CRITICAL')) AS high_risk,
                           max(persisted_at) AS last_event_at,
                           count(*) FILTER (WHERE persisted_at > clock_timestamp() - interval '60 seconds')
                             AS last_minute
-                   FROM predictions GROUP BY source ORDER BY txns DESC""").fetchall()
+                   FROM predictions {org_f} GROUP BY source ORDER BY txns DESC""",
+                org_p).fetchall()
             alerts = c.execute(
-                """SELECT count(*) AS total,
+                f"""SELECT count(*) AS total,
                           count(*) FILTER (WHERE status = 'OPEN') AS open,
                           count(*) FILTER (WHERE status = 'IN_REVIEW') AS in_review,
                           count(*) FILTER (WHERE status = 'CONFIRMED_FRAUD') AS confirmed,
                           count(*) FILTER (WHERE status = 'FALSE_POSITIVE') AS false_positive,
                           count(*) FILTER (WHERE escalation_level > 0 AND status IN ('OPEN','IN_REVIEW')) AS escalated,
                           count(*) FILTER (WHERE status = 'OPEN' AND sla_due_at < clock_timestamp()) AS sla_breached
-                   FROM alerts""").fetchone()
+                   FROM alerts {org_f}""", org_p).fetchone()
             quality = c.execute(
                 f"""SELECT count(*) AS labelled,
                            count(*) FILTER (WHERE l.is_fraud AND p.risk_level IN ('HIGH','CRITICAL')) AS tp,
                            count(*) FILTER (WHERE NOT l.is_fraud AND p.risk_level IN ('HIGH','CRITICAL')) AS fp,
                            count(*) FILTER (WHERE l.is_fraud AND p.risk_level NOT IN ('HIGH','CRITICAL')) AS fn
-                    FROM labels l JOIN predictions p USING (transaction_id)
+                    FROM labels l JOIN predictions p USING (org_id, transaction_id)
                         {f.replace("source", "p.source")}""", params).fetchone()
         return {
             "source_filter": source,
+            "org_filter": org,
             "processed": totals["processed"],
             "tps_last_minute": round(minute["n"] / 60, 2),
             "total_volume": totals["total_volume"],
@@ -502,7 +633,7 @@ class Repository:
             "label_quality": quality,
         }
 
-    def performance(self, window_minutes: int = 5) -> dict:
+    def performance(self, window_minutes: int = 5, org: str | None = None) -> dict:
         """Measured latency percentiles over the last N minutes of stored rows.
 
         Historical imports are excluded from latency: they are bulk-loaded, so
@@ -516,8 +647,9 @@ class Repository:
                        percentile_cont(ARRAY[0.5, 0.95, 0.99]) WITHIN GROUP (ORDER BY feature_ms) AS feature,
                        min(persisted_at) AS first_at, max(persisted_at) AS last_at
                     FROM predictions
-                    WHERE persisted_at > clock_timestamp() - make_interval(mins => %s) AND {LIVE_SOURCES_SQL}""",
-                (window_minutes,)).fetchone()
+                    WHERE persisted_at > clock_timestamp() - make_interval(mins => %s) AND {LIVE_SOURCES_SQL}
+                      AND (%s::text IS NULL OR org_id = %s)""",
+                (window_minutes, org, org)).fetchone()
 
         def pct(arr):
             return None if not arr or arr[0] is None else {
@@ -545,6 +677,94 @@ class Repository:
         span = (rows[0]["persisted_at"] - rows[-1]["persisted_at"]).total_seconds() / 3600
         return [r["features"] for r in rows], span
 
+    # ---- account holders (CUSTOMER) --------------------------------------------------
+    def customer_transactions(self, org: str, account_ids: list[str], limit: int) -> list[dict]:
+        """A customer's own payments with a plain status. No scores or reason codes: those are for the bank."""
+        if not account_ids:
+            return []
+        with self.pool.connection() as c:
+            return c.execute(
+                """SELECT p.transaction_id, p.event_time, p.account_id, p.counterparty_id, p.txn_type, p.amount,
+                          CASE WHEN a.status = 'CONFIRMED_FRAUD' THEN 'CONFIRMED_FRAUD'
+                               WHEN a.status IN ('OPEN', 'IN_REVIEW') OR p.decision IN ('REVIEW', 'HOLD')
+                                    AND coalesce(a.status, '') <> 'FALSE_POSITIVE' THEN 'UNDER_REVIEW'
+                               ELSE 'OK' END AS status,
+                          r.report_id IS NOT NULL AS reported
+                   FROM predictions p
+                   LEFT JOIN alert_transactions t USING (org_id, transaction_id)
+                   LEFT JOIN alerts a ON a.alert_id = t.alert_id
+                   LEFT JOIN LATERAL (SELECT report_id FROM customer_reports cr
+                                      WHERE cr.org_id = p.org_id AND cr.transaction_id = p.transaction_id
+                                      LIMIT 1) r ON TRUE
+                   WHERE p.org_id = %s AND p.account_id = ANY(%s)
+                   ORDER BY p.event_time DESC LIMIT %s""", (org, list(account_ids), limit)).fetchall()
+
+    def customer_report(self, org: str, username: str, account_ids: list[str], transaction_id: str,
+                        kind: str, note: str | None) -> dict | None:
+        """Record a customer's report and put it in front of analysts: it joins the payment's alert,
+        or opens a new priority-2 alert. None if the payment is not one of theirs."""
+        with self.pool.connection() as c, c.transaction():
+            p = c.execute("SELECT * FROM predictions WHERE org_id = %s AND transaction_id = %s "
+                          "AND account_id = ANY(%s)", (org, transaction_id, list(account_ids))).fetchone()
+            if p is None:
+                return None
+            c.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"{org}|{p['account_id']}",))
+            existing = c.execute("SELECT alert_id FROM alert_transactions WHERE org_id = %s AND transaction_id = %s",
+                                 (org, transaction_id)).fetchone()
+            reason = "REPORTED_BY_CUSTOMER"
+            if existing:
+                alert_id = existing["alert_id"]
+                c.execute(
+                    """UPDATE alerts SET priority = least(priority, 2),
+                           trigger_types = ARRAY(SELECT DISTINCT unnest(trigger_types || '{CUSTOMER_REPORT}')),
+                           reason_codes = ARRAY(SELECT DISTINCT unnest(reason_codes || %s::text[])),
+                           status = CASE WHEN status = 'FALSE_POSITIVE' THEN 'OPEN' ELSE status END,
+                           updated_at = clock_timestamp() WHERE alert_id = %s""", ([reason], alert_id))
+            else:
+                alert_id = c.execute(
+                    """INSERT INTO alerts (org_id, account_id, first_transaction, priority, trigger_types, reason_codes,
+                           max_risk_score, total_amount, sla_due_at)
+                       VALUES (%s,%s,%s,2,'{CUSTOMER_REPORT}',%s,%s,%s, clock_timestamp() + interval '30 minutes')
+                       RETURNING alert_id""",
+                    (org, p["account_id"], transaction_id, [reason], p["risk_score"],
+                     p["amount"])).fetchone()["alert_id"]
+                c.execute("INSERT INTO alert_transactions (org_id, transaction_id, alert_id, trigger_types) "
+                          "VALUES (%s,%s,%s,'{CUSTOMER_REPORT}')", (org, transaction_id, alert_id))
+            c.execute("INSERT INTO alert_events (alert_id, kind, detail, actor) VALUES (%s,'CUSTOMER_REPORT',%s,%s)",
+                      (alert_id, Jsonb({"transaction_id": transaction_id, "kind": kind}), username))
+            row = c.execute(
+                """INSERT INTO customer_reports (org_id, username, transaction_id, kind, note, alert_id)
+                   VALUES (%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (org_id, transaction_id, username) DO UPDATE SET kind = EXCLUDED.kind,
+                       note = coalesce(EXCLUDED.note, customer_reports.note)
+                   RETURNING report_id, transaction_id, kind, note, alert_id, created_at""",
+                (org, username, transaction_id, kind, note, alert_id)).fetchone()
+            row["alert"] = c.execute("SELECT * FROM alerts WHERE alert_id = %s", (alert_id,)).fetchone()
+            return row
+
+    def customer_reports(self, org: str, username: str) -> list[dict]:
+        with self.pool.connection() as c:
+            return c.execute(
+                """SELECT r.report_id, r.transaction_id, r.kind, r.note, r.created_at,
+                          CASE a.status WHEN 'CONFIRMED_FRAUD' THEN 'CONFIRMED_FRAUD'
+                                        WHEN 'FALSE_POSITIVE' THEN 'CLOSED_NO_FRAUD'
+                                        ELSE 'UNDER_REVIEW' END AS status
+                   FROM customer_reports r LEFT JOIN alerts a USING (alert_id)
+                   WHERE r.org_id = %s AND r.username = %s ORDER BY r.report_id DESC""", (org, username)).fetchall()
+
+    # ---- public figures for the home page ---------------------------------------------
+    def public_summary(self) -> dict:
+        """Platform-wide totals only: no organisation, account or amount is identifiable."""
+        with self.pool.connection() as c:
+            return c.execute(
+                """SELECT count(*) AS transactions_24h,
+                          count(*) FILTER (WHERE risk_level IN ('HIGH', 'CRITICAL')) AS flagged_24h,
+                          percentile_cont(0.5) WITHIN GROUP (ORDER BY pipeline_ms)
+                              FILTER (WHERE source <> 'HISTORICAL_IMPORT') AS p50_pipeline_ms,
+                          (SELECT count(*) FROM organisations WHERE status = 'ACTIVE') AS organisations
+                   FROM predictions WHERE persisted_at > now() - interval '24 hours'""").fetchone()
+
+
 
 def connect_with_retry(dsn: str, attempts: int = 30) -> Repository:
     for i in range(attempts):
@@ -555,3 +775,4 @@ def connect_with_retry(dsn: str, attempts: int = 30) -> Repository:
         except psycopg.OperationalError:
             time.sleep(min(2 ** i, 5))
     raise RuntimeError("database not reachable")
+

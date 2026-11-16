@@ -320,3 +320,20 @@ ul.codes { display: grid; grid-template-columns: repeat(2, max-content); gap: 6p
   header.topbar { position: static; }
   .gauge { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* ---- organisation label in the sidebar ---- */
+.side-org { margin: -8px 8px 12px; font-size: 12px; color: var(--ink-2); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+a.signin-brand { text-decoration: none; color: inherit; }
+
+/* ---- customer portal ---- */
+.portal { min-height: 100vh; display: flex; flex-direction: column; }
+.aware-strip { background: #111418; color: #f2f3f5; padding: 7px 20px; font-size: 12.5px; }
+.aware-strip a { color: #fff; margin-left: 8px; font-weight: 600; }
+.portal-head { display: flex; align-items: center; gap: 14px; margin: 12px; padding: 10px 16px; border-radius: var(--r-lg); }
+.portal-head .grow { flex: 1; }
+.who-text.right { text-align: right; flex: none; }
+.portal-main { max-width: 1080px; width: 100%; margin: 0 auto; padding: 0 12px 24px; display: flex; flex-direction: column; gap: 12px; }
+.panel.report { border-color: rgba(183, 121, 31, .4); }
+fieldset.choices { border: 0; padding: 0; margin: 8px 0 12px; display: grid; gap: 6px; }
+label.choice { flex-direction: row; align-items: center; gap: 8px; font-weight: 400; font-size: 13px; color: var(--ink); }
+textarea { font: inherit; color: var(--ink); background: rgba(255, 255, 255, .9); border: 1px solid var(--axis); border-radius: var(--r-sm); padding: 7px 9px; resize: vertical; }

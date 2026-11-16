@@ -1,30 +1,38 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
 import {
-  Alert, AlertDetail, AlertStatus, AuditRow, Connector, Drift, DriftStatus, LEVELS, Me, Pct, Policy, RiskLevel, Role, SOURCE_LABEL,
-  ScoreResult, Source, Stats, Status, Txn, TxnDetail, User, api, session,
+  Alert, AlertDetail, AlertStatus, ApiKey, AuditRow, Connector, CustomerReport, CustomerTxn, Drift, DriftStatus, LEVELS, Me, Org, Pct,
+  Policy, ReportKind, RiskLevel, Role, SOURCE_LABEL, ScoreResult, Source, Stats, Status, Txn, TxnDetail, User, api, session,
 } from "./api";
 import { LEVEL_COLOR, LEVEL_ICON, MinuteSeries, RiskDistribution } from "./charts";
 import { Live, useLive } from "./live";
 import { Scene3D } from "./Scene3D";
+import { onNav } from "./router";
+import { BANNER_TIPS, HELPLINE, REPORT_URL } from "./home/content";
 
-type Tab = "overview" | "alerts" | "check" | "performance" | "integrations" | "ingest" | "settings" | "admin" | "security";
+type Tab = "platform" | "overview" | "alerts" | "check" | "performance" | "integrations" | "ingest" | "settings" | "admin" | "security";
 // What each role sees. The server enforces the same rules; this only hides what would be refused.
+// CUSTOMER never reaches the console: account holders get their own portal (CustomerPortal).
 const TABS: Record<Role, Tab[]> = {
   VIEWER: ["overview", "alerts", "performance", "integrations", "security"],
   ANALYST: ["overview", "alerts", "check", "performance", "integrations", "security"],
-  ADMIN: ["overview", "alerts", "check", "performance", "integrations", "ingest", "settings", "admin", "security"],
+  // Risk settings apply to every organisation, so only the platform operator changes them.
+  ADMIN: ["overview", "alerts", "check", "performance", "integrations", "ingest", "admin", "security"],
+  SUPERADMIN: ["platform", "overview", "alerts", "performance", "integrations", "settings", "admin", "security"],
+  CUSTOMER: [],
 };
 const NAV: { group: string; tabs: Tab[] }[] = [
+  { group: "Platform", tabs: ["platform"] },
   { group: "Monitor", tabs: ["overview", "alerts", "check"] },
   { group: "System", tabs: ["performance", "integrations"] },
   { group: "Administration", tabs: ["ingest", "settings", "admin"] },
 ];
 const TAB_LABEL: Record<Tab, string> = {
-  overview: "Overview", alerts: "Alerts", check: "Check a transaction", performance: "Performance", integrations: "Integrations",
-  ingest: "Data intake", settings: "Settings", admin: "People and audit", security: "Security",
+  platform: "Organisations", overview: "Overview", alerts: "Alerts", check: "Check a transaction", performance: "Performance",
+  integrations: "Integrations", ingest: "Data intake", settings: "Settings", admin: "People and audit", security: "Security",
 };
 const TAB_INTRO: Record<Tab, string> = {
+  platform: "Every organisation on this platform: create, rename and suspend. Their data stays theirs.",
   overview: "Scored transactions, as stored by the pipeline.",
   alerts: "Work the queue. Every change is recorded in the audit log under your name.",
   check: "Score one transaction against the live model and feature store. Nothing is stored.",
@@ -64,7 +72,7 @@ function health(live: Live): { state: Health; title: string; detail: string } {
   if (live.conn === "connecting" && !live.status) return { state: "connecting", title: "CONNECTING", detail: "Waiting for the first message from the server." };
   if (live.conn !== "connected") {
     return { state: "offline", title: "NO CONNECTION TO SERVER",
-             detail: `This browser lost its connection to the VYROX API. Everything below is what was last received at ${lastSeen} and is not live. Reconnecting automatically.` };
+             detail: `This browser lost its connection to the FORESENTRY API. Everything below is what was last received at ${lastSeen} and is not live. Reconnecting automatically.` };
   }
   const st = live.status;
   if (!st) return { state: "connecting", title: "CONNECTING", detail: "Connected. Waiting for pipeline status." };
@@ -118,14 +126,17 @@ export default function App() {
     return session.onExpired(() => setMe(null));
   }, []);
   if (checking) return <div className="boot">Checking your session.</div>;
-  if (!me) return <SignIn onSignedIn={setMe} initialError={ssoError} />;
-  return <Console me={me} onSignOut={() => { api.logout().catch(() => undefined).finally(() => setMe(null)); }} />;
+  // The sign-in answer has the role; /me adds the organisation, so read it once signed in.
+  if (!me) return <SignIn onSignedIn={(m) => { setMe(m); api.me().then(setMe).catch(() => undefined); }} initialError={ssoError} />;
+  const signOut = () => { api.logout().catch(() => undefined).finally(() => setMe(null)); };
+  if (me.role === "CUSTOMER") return <CustomerPortal me={me} onSignOut={signOut} />;
+  return <Console me={me} onSignOut={signOut} />;
 }
 
 function loginError(m: string): string {
   if (m.startsWith("401")) return "Wrong username or password.";
   if (m.startsWith("429")) return "Too many failed attempts. Try again in 15 minutes.";
-  if (m.includes("Failed to fetch")) return "Cannot reach the VYROX server.";
+  if (m.includes("Failed to fetch")) return "Cannot reach the FORESENTRY server.";
   return m;
 }
 
@@ -163,11 +174,11 @@ function SignIn({ onSignedIn, initialError }: { onSignedIn: (me: Me) => void; in
   return (
     <div className="signin">
       <div className="signin-card glass">
-        <div className="signin-brand"><span className="mark" aria-hidden>V</span> VYROX</div>
+        <a className="signin-brand" href="/" onClick={onNav("/")}><span className="mark" aria-hidden>F</span> FORESENTRY</a>
         {!mfa ? (
           <form onSubmit={submit} data-testid="signin">
             <h1>Sign in</h1>
-            <p className="muted">Fraud operations console.</p>
+            <p className="muted">Fraud teams, account holders and platform operators use the same sign-in.</p>
             <label>Username<input autoFocus autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} /></label>
             <label>Password<input type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
             {error && <div className="error" role="alert">{error}</div>}
@@ -199,7 +210,7 @@ function SignIn({ onSignedIn, initialError }: { onSignedIn: (me: Me) => void; in
 // ---- console shell --------------------------------------------------------------------
 
 function Console({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
-  const [tab, setTab] = useState<Tab>("overview");
+  const [tab, setTab] = useState<Tab>(me.role === "SUPERADMIN" ? "platform" : "overview");
   const [source, setSource] = useState<Source | null>(null);
   const seed = useCallback(() => api.recent(500, null), []);
   const live = useLive(seed);
@@ -226,9 +237,11 @@ function Console({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     <div className="shell">
       <aside className="side glass">
         <div className="side-brand">
-          <span className="mark" aria-hidden>V</span>
-          <span className="side-name">VYROX</span>
+          <span className="mark" aria-hidden>F</span>
+          <span className="side-name">FORESENTRY</span>
         </div>
+        {me.org_name && <div className="side-org" title={`Organisation ${me.org_id}`}>{me.org_name}</div>}
+        {me.role === "SUPERADMIN" && <div className="side-org">Platform operator</div>}
         <div className={`env env-${env ?? "unknown"}`} title="Environment of the server this dashboard is connected to">
           {env === "demo" ? "DEMO · simulated data" : env === "production" ? "PRODUCTION" : "ENVIRONMENT UNKNOWN"}
         </div>
@@ -262,7 +275,8 @@ function Console({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       <div className="content">
         <header className="topbar">
           <div className="crumbs">
-            <span className="muted">Workspace</span><span className="sep">/</span><h2>{TAB_LABEL[tab]}</h2>
+            <span className="muted">{me.role === "SUPERADMIN" ? "All organisations" : me.org_name ?? "Workspace"}</span>
+            <span className="sep">/</span><h2>{TAB_LABEL[tab]}</h2>
             <p className="intro muted">{TAB_INTRO[tab]}</p>
           </div>
           <label className="filter">Data source
@@ -294,6 +308,7 @@ function Console({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         )}
 
         <main className={h.state === "live" ? "" : "stale"}>
+          {tab === "platform" && <Platform now={now} />}
           {tab === "overview" && <Overview stats={stats} feed={feed} live={live} source={source} now={now} onOpen={setOpenTxn} isLive={h.state === "live"} />}
           {tab === "alerts" && <Alerts live={live} now={now} onOpenTxn={setOpenTxn} me={me} />}
           {tab === "check" && <CheckTransaction />}
@@ -973,13 +988,21 @@ function Settings() {
 
 // ---- people and audit -----------------------------------------------------------------
 
-const ROLES: Role[] = ["VIEWER", "ANALYST", "ADMIN"];
+const ORG_ROLES: Role[] = ["VIEWER", "ANALYST", "ADMIN", "CUSTOMER"];
 
 function Admin({ me }: { me: Me }) {
+  const platform = me.role === "SUPERADMIN";
+  const ROLES: Role[] = platform ? [...ORG_ROLES, "SUPERADMIN"] : ORG_ROLES;
   const [users, setUsers] = useState<User[]>([]);
   const [audit, setAudit] = useState<AuditRow[]>([]);
   const [msg, setMsg] = useState("");
-  const [form, setForm] = useState({ username: "", password: "", role: "ANALYST" as Role });
+  const [form, setForm] = useState({ username: "", password: "", role: "ANALYST" as Role, org_id: "", accounts: "" });
+  const extra = () => ({
+    ...(platform && form.role !== "SUPERADMIN" && form.org_id.trim() ? { org_id: form.org_id.trim() } : {}),
+    ...(form.role === "CUSTOMER" ? { account_ids: form.accounts.split(/[\s,]+/).filter(Boolean) } : {}),
+  });
+  const formReady = form.username && form.password.length >= 10
+    && (form.role !== "CUSTOMER" || form.accounts.trim()) && (!platform || form.role === "SUPERADMIN" || form.org_id.trim());
   const load = useCallback(() => {
     Promise.all([api.users(), api.audit()]).then(([u, a]) => { setUsers(u); setAudit(a); }).catch((e) => setMsg(String(e.message)));
   }, []);
@@ -995,10 +1018,12 @@ function Admin({ me }: { me: Me }) {
         <div className="panel-head"><h3>People</h3><span className="muted small">who can sign in, and what they may do</span></div>
         {msg && <div className="notice" role="status">{msg}</div>}
         <table data-testid="users">
-          <thead><tr><th>Username</th><th>Role</th>{reportsMfa && <th>Sign-in</th>}<th>Status</th><th></th></tr></thead>
+          <thead><tr><th>Username</th>{platform && <th>Organisation</th>}<th>Role</th>{reportsMfa && <th>Sign-in</th>}<th>Status</th><th></th></tr></thead>
           <tbody>{users.map((u) => (
             <tr key={u.username}>
-              <td className="mono">{u.username}{u.username === me.username && <span className="muted"> (you)</span>}</td>
+              <td className="mono">{u.username}{u.username === me.username && <span className="muted"> (you)</span>}
+                {u.role === "CUSTOMER" && u.account_ids?.length ? <div className="muted small">{u.account_ids.join(", ")}</div> : null}</td>
+              {platform && <td className="mono small">{u.org_id ?? <span className="muted">platform</span>}</td>}
               <td>
                 <select value={u.role} aria-label={`Role of ${u.username}`}
                         onChange={(e) => run(`Role of ${u.username}`, () => api.changeUser(u.username, { role: e.target.value as Role }))}>
@@ -1026,7 +1051,8 @@ function Admin({ me }: { me: Me }) {
         </table>
         <h4>Add a person</h4>
         <form className="form" onSubmit={(e) => { e.preventDefault(); run(`Add ${form.username}`, async () => {
-          await api.createUser(form.username, form.password, form.role); setForm({ username: "", password: "", role: "ANALYST" }); }); }}>
+          await api.createUser(form.username, form.password, form.role, extra());
+          setForm({ username: "", password: "", role: "ANALYST", org_id: form.org_id, accounts: "" }); }); }}>
           <label>Username<input value={form.username} autoComplete="off" onChange={(e) => setForm({ ...form, username: e.target.value })} /></label>
           <label>Initial password (10 or more characters)
             <input type="password" autoComplete="new-password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></label>
@@ -1034,10 +1060,18 @@ function Admin({ me }: { me: Me }) {
             <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as Role })}>
               {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
             </select></label>
-          <div className="actions"><button className="primary" type="submit" disabled={!form.username || form.password.length < 10}>Add person</button></div>
+          {platform && form.role !== "SUPERADMIN" && (
+            <label>Organisation id<input value={form.org_id} placeholder="demo" onChange={(e) => setForm({ ...form, org_id: e.target.value })} /></label>
+          )}
+          {form.role === "CUSTOMER" && (
+            <label>Account ids (comma-separated)<input value={form.accounts} placeholder="C00000001" onChange={(e) => setForm({ ...form, accounts: e.target.value })} /></label>
+          )}
+          <div className="actions"><button className="primary" type="submit" disabled={!formReady}>Add person</button></div>
         </form>
         <p className="muted">Viewer: read only. Analyst: can also work alerts. Admin: can also change settings, import data and manage people.
-          Changing a role or deactivating someone signs them out everywhere.</p>
+          Customer: an account holder who sees only their own payments and can report one. Changing a role or deactivating someone
+          signs them out everywhere.</p>
+        {me.role === "ADMIN" && <ApiKeys />}
       </div>
       <div className="panel">
         <div className="panel-head"><h3>Audit log</h3><span className="muted small grow">latest {audit.length} entries, newest first</span>
@@ -1056,6 +1090,247 @@ function Admin({ me }: { me: Me }) {
         </div>
         {audit.length === 0 && <div className="empty">No entries yet.</div>}
       </div>
+    </div>
+  );
+}
+
+// ---- API keys (org admin) ---------------------------------------------------------------
+
+function ApiKeys() {
+  const [keys, setKeys] = useState<ApiKey[] | null>(null);
+  const [missing, setMissing] = useState(false);
+  const [label, setLabel] = useState("");
+  const [fresh, setFresh] = useState<{ label: string; key: string } | null>(null);
+  const [msg, setMsg] = useState("");
+  const load = useCallback(() => {
+    api.apiKeys().then(setKeys).catch((e) => { if (notFound(e)) setMissing(true); else setMsg((e as Error).message); });
+  }, []);
+  useEffect(load, [load]);
+  if (missing) return <><h4>API keys</h4><p className="muted">This server does not manage per-organisation API keys yet.</p></>;
+  return (
+    <>
+      <h4>API keys <span className="muted">for systems that send payments to this organisation</span></h4>
+      {fresh && (
+        <div className="notice" role="status">
+          Key for <b>{fresh.label}</b>, shown only now: <code className="secret">{fresh.key}</code>{" "}
+          <button onClick={() => navigator.clipboard?.writeText(fresh.key).then(() => setMsg("Copied."), () => setMsg("Copy failed."))}>Copy</button>{" "}
+          <button className="ghost" onClick={() => setFresh(null)}>Done</button>
+        </div>
+      )}
+      {msg && <p className="note">{msg}</p>}
+      <table className="compact">
+        <thead><tr><th>Label</th><th>Starts with</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+        <tbody>
+          {(keys ?? []).map((k) => (
+            <tr key={k.id}><td>{k.label}</td><td className="mono">{k.prefix}…</td><td>{new Date(k.created_at).toLocaleDateString()}</td>
+              <td>{k.last_used_at ? new Date(k.last_used_at).toLocaleString() : <span className="muted">never</span>}</td>
+              <td className="r"><button className="danger" onClick={() => {
+                if (window.confirm(`Revoke the key "${k.label}"? Systems using it will be refused at once.`))
+                  api.deleteApiKey(k.id).then(() => { setMsg(`Revoked ${k.label}.`); load(); }, (e) => setMsg((e as Error).message));
+              }}>Revoke</button></td></tr>
+          ))}
+          {keys && !keys.length && <tr><td colSpan={5} className="muted">No keys yet.</td></tr>}
+        </tbody>
+      </table>
+      <form className="actions" onSubmit={(e) => {
+        e.preventDefault();
+        api.createApiKey(label.trim()).then((k) => { setFresh({ label: k.label, key: k.key }); setLabel(""); load(); }, (err) => setMsg((err as Error).message));
+      }}>
+        <label className="inline">Label<input value={label} placeholder="core banking" onChange={(e) => setLabel(e.target.value)} /></label>
+        <button type="submit" disabled={!label.trim()}>Create key</button>
+      </form>
+    </>
+  );
+}
+
+// ---- platform (superadmin) ---------------------------------------------------------------
+
+function Platform({ now }: { now: number }) {
+  const [orgs, setOrgs] = useState<Org[] | null>(null);
+  const [state, setState] = useState<"loading" | "ok" | "missing" | "error">("loading");
+  const [msg, setMsg] = useState("");
+  const [form, setForm] = useState({ org_id: "", name: "", region: "" });
+  const load = useCallback(() => {
+    api.orgs().then((o) => { setOrgs(o); setState("ok"); })
+      .catch((e) => { setState(notFound(e) ? "missing" : "error"); setMsg((e as Error).message); });
+  }, []);
+  useEffect(() => { load(); const t = setInterval(load, 30_000); return () => clearInterval(t); }, [load]);
+  const run = async (what: string, fn: () => Promise<unknown>) => {
+    try { await fn(); setMsg(`${what}: done.`); } catch (e) { setMsg(`${what}: ${(e as Error).message}`); }
+    load();
+  };
+  const slugOk = /^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/.test(form.org_id);
+  const totals = orgs?.reduce((a, o) => ({ txns: a.txns + o.transactions_24h, alerts: a.alerts + o.open_alerts, users: a.users + o.users,
+                                         active: a.active + (o.status === "ACTIVE" ? 1 : 0) }), { txns: 0, alerts: 0, users: 0, active: 0 });
+  if (state === "missing") return <div className="panel"><div className="empty">This server does not support organisations yet. Update the API to manage them here.</div></div>;
+  return (
+    <>
+      {totals && (
+        <div className="kpis">
+          <Kpi label="Organisations" value={num(orgs!.length)} sub={`${totals.active} active`} />
+          <Kpi label="Payments, 24 h" value={num(totals.txns)} sub="all organisations" />
+          <Kpi label="Open alerts" value={num(totals.alerts)} sub="all organisations" />
+          <Kpi label="People" value={num(totals.users)} sub="with a sign-in" />
+        </div>
+      )}
+      <div className="panel">
+        <div className="panel-head"><h3>Organisations</h3><span className="muted small grow">refreshed every 30 s</span><button onClick={load}>Refresh</button></div>
+        {msg && <div className="notice" role="status">{msg}</div>}
+        {state === "loading" && <div className="empty">Loading.</div>}
+        {orgs && (
+          <div className="table-wrap">
+            <table data-testid="orgs">
+              <thead><tr><th>Organisation</th><th>Id</th><th>Region</th><th>State</th><th className="r">People</th><th className="r">Payments, 24 h</th>
+                <th className="r">Open alerts</th><th>Last payment</th><th></th></tr></thead>
+              <tbody>
+                {orgs.map((o) => (
+                  <tr key={o.org_id}>
+                    <td>{o.name}</td><td className="mono small">{o.org_id}</td><td>{o.region ?? <span className="muted">not set</span>}</td>
+                    <td><span className={`state ${o.status === "ACTIVE" ? "ok" : "bad"}`}>{o.status.toLowerCase()}</span></td>
+                    <td className="r">{num(o.users)}</td><td className="r">{num(o.transactions_24h)}</td><td className="r">{num(o.open_alerts)}</td>
+                    <td>{ago(o.last_event_at, now)}</td>
+                    <td className="r">
+                      {o.status === "ACTIVE"
+                        ? <button className="danger" onClick={() => { if (window.confirm(`Suspend ${o.name}? Its people are signed out and its API keys are refused until you reactivate it.`))
+                            run(`Suspend ${o.name}`, () => api.updateOrg(o.org_id, { status: "SUSPENDED" })); }}>Suspend</button>
+                        : <button onClick={() => run(`Reactivate ${o.name}`, () => api.updateOrg(o.org_id, { status: "ACTIVE" }))}>Reactivate</button>}
+                    </td>
+                  </tr>
+                ))}
+                {!orgs.length && <tr><td colSpan={9} className="muted">No organisations yet.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+      <div className="panel narrow">
+        <div className="panel-head"><h3>Add an organisation</h3></div>
+        <form className="form" onSubmit={(e) => { e.preventDefault(); run(`Create ${form.name}`, async () => {
+          await api.createOrg(form.org_id, form.name.trim(), form.region.trim()); setForm({ org_id: "", name: "", region: "" }); }); }}>
+          <label>Name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Example Cooperative Bank" /></label>
+          <label>Id<input value={form.org_id} onChange={(e) => setForm({ ...form, org_id: e.target.value.toLowerCase() })} placeholder="example-coop" /></label>
+          <label>Region<input value={form.region} onChange={(e) => setForm({ ...form, region: e.target.value })} placeholder="Maharashtra" /></label>
+          <div className="actions"><button className="primary" type="submit" disabled={!slugOk || !form.name.trim()}>Create</button>
+            {form.org_id && !slugOk && <span className="muted small">Id: 3 to 40 lowercase letters, digits or hyphens.</span>}</div>
+        </form>
+        <p className="muted">Then add the organisation's first administrator under People and audit, with this organisation id.</p>
+      </div>
+    </>
+  );
+}
+
+// ---- customer portal ----------------------------------------------------------------------
+
+const TXN_KIND: Record<string, string> = {
+  TRANSFER: "Transfer", PAYMENT: "Payment", CASH_OUT: "Cash withdrawal", DEBIT: "Debit", CASH_IN: "Deposit",
+};
+const REPORT_STATUS: Record<string, string> = {
+  UNDER_REVIEW: "Being checked by the bank", CONFIRMED_FRAUD: "Confirmed as fraud", CLOSED_NO_FRAUD: "Closed: no fraud found",
+};
+const TXN_STATUS: Record<CustomerTxn["status"], string> = { OK: "Completed", UNDER_REVIEW: "Being checked", CONFIRMED_FRAUD: "Stopped as fraud" };
+const REPORT_KIND: Record<ReportKind, string> = { NOT_ME: "I did not make this payment", SCAM: "I was tricked into paying", OTHER: "Something else" };
+
+function CustomerPortal({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
+  const [txns, setTxns] = useState<CustomerTxn[] | null>(null);
+  const [reports, setReports] = useState<CustomerReport[]>([]);
+  const [state, setState] = useState<"loading" | "ok" | "missing" | "error">("loading");
+  const [err, setErr] = useState("");
+  const [open, setOpen] = useState<CustomerTxn | null>(null);
+  const [kind, setKind] = useState<ReportKind>("NOT_ME");
+  const [note, setNote] = useState("");
+  const [sent, setSent] = useState("");
+  const [tip] = useState(() => BANNER_TIPS[Math.floor(Math.random() * BANNER_TIPS.length)]);
+  const load = useCallback(() => {
+    Promise.all([api.myTransactions(50), api.myReports().catch(() => [] as CustomerReport[])])
+      .then(([t, r]) => { setTxns(t); setReports(r); setState("ok"); })
+      .catch((e) => { setState(notFound(e) ? "missing" : "error"); setErr((e as Error).message); });
+  }, []);
+  useEffect(() => { load(); const t = setInterval(load, 30_000); return () => clearInterval(t); }, [load]);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!open) return;
+    try { await api.report(open.transaction_id, kind, note); setSent(`Reported. The fraud team at ${me.org_name ?? "your bank"} will look at it.`); setOpen(null); setNote(""); load(); }
+    catch (e2) { setSent(`Not sent: ${(e2 as Error).message}`); }
+  };
+  return (
+    <div className="portal">
+      <div className="aware-strip"><b>Stay safe.</b> {tip} <a href={`tel:${HELPLINE}`}>Helpline {HELPLINE}</a></div>
+      <header className="portal-head glass">
+        <a className="signin-brand" href="/" onClick={onNav("/")}><span className="mark" aria-hidden>F</span> FORESENTRY</a>
+        <span className="muted">{me.org_name ?? ""}</span>
+        <span className="grow" />
+        <span className="who-text right"><b>{me.username}</b><span className="muted">account holder</span></span>
+        <button className="ghost" onClick={onSignOut}>Sign out</button>
+      </header>
+      <main className="portal-main">
+        <div className="panel">
+          <div className="panel-head"><h3>Your recent payments</h3><span className="muted small grow">from the accounts linked to your sign-in</span></div>
+          {sent && <div className="notice" role="status">{sent}</div>}
+          {state === "loading" && <div className="empty">Loading.</div>}
+          {state === "missing" && <div className="empty">This server does not offer the account-holder view yet.</div>}
+          {state === "error" && <div className="error">{err}</div>}
+          {txns && (
+            <div className="table-wrap">
+              <table data-testid="my-payments">
+                <thead><tr><th>When</th><th>To</th><th>Type</th><th className="r">Amount</th><th>Status</th><th></th></tr></thead>
+                <tbody>
+                  {txns.map((t) => (
+                    <tr key={t.transaction_id}>
+                      <td>{new Date(t.event_time).toLocaleString()}</td><td className="mono">{t.counterparty_id}</td><td>{TXN_KIND[t.txn_type] ?? t.txn_type}</td>
+                      <td className="r">{inr(t.amount)}</td>
+                      <td><span className={`status ${t.status === "OK" ? "s-OPEN" : t.status === "CONFIRMED_FRAUD" ? "s-CONFIRMED_FRAUD" : "s-IN_REVIEW"}`}>{TXN_STATUS[t.status]}</span></td>
+                      <td className="r">{t.reported ? <span className="muted small">reported</span>
+                        : <button onClick={() => { setOpen(t); setSent(""); }}>Report a problem</button>}</td>
+                    </tr>
+                  ))}
+                  {!txns.length && <tr><td colSpan={6} className="muted">No payments yet.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p className="note">"Being checked" means your bank's fraud team is looking at the payment. Your bank may contact you; it will never ask for your OTP or PIN.</p>
+        </div>
+
+        {open && (
+          <form className="panel report" onSubmit={submit}>
+            <div className="panel-head"><h3>Report a problem with this payment</h3><button type="button" className="ghost" onClick={() => setOpen(null)}>Cancel</button></div>
+            <p>{inr(open.amount)} to <span className="mono">{open.counterparty_id}</span> on {new Date(open.event_time).toLocaleString()}</p>
+            <fieldset className="choices">
+              {(Object.keys(REPORT_KIND) as ReportKind[]).map((k) => (
+                <label key={k} className="choice"><input type="radio" name="kind" checked={kind === k} onChange={() => setKind(k)} /> {REPORT_KIND[k]}</label>
+              ))}
+            </fieldset>
+            <label>What happened (optional)<textarea rows={3} value={note} onChange={(e) => setNote(e.target.value)} maxLength={1000} /></label>
+            <div className="actions"><button className="primary" type="submit">Send report</button></div>
+            <p className="note">If money left your account because of a scam, also call {HELPLINE} now. Reporting quickly gives the best chance to stop the money.</p>
+          </form>
+        )}
+
+        <div className="grid2">
+          <div className="panel">
+            <div className="panel-head"><h3>Your reports</h3></div>
+            <table className="compact">
+              <tbody>
+                {reports.map((r, i) => (
+                  <tr key={r.report_id ?? i}><td>{new Date(r.created_at).toLocaleString()}</td><td className="mono">{r.transaction_id}</td>
+                    <td>{REPORT_KIND[r.kind]}</td><td>{REPORT_STATUS[r.status ?? ""] ?? "Received"}</td></tr>
+                ))}
+                {!reports.length && <tr><td className="muted">You have not reported anything.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+          <div className="panel">
+            <div className="panel-head"><h3>Lost money to a scam?</h3></div>
+            <ol className="steps">
+              <li><b>Call {HELPLINE}</b>, the national cyber-crime helpline.</li>
+              <li><b>Call your bank</b> on the number on your card to block the card or UPI.</li>
+              <li><b>Report online</b> at <a href={REPORT_URL} target="_blank" rel="noreferrer">cybercrime.gov.in</a>.</li>
+            </ol>
+            <p className="note"><a href="/learn/after-fraud" onClick={onNav("/learn/after-fraud")}>What to do after a fraud</a> ·{" "}
+              <a href="/#learn" onClick={onNav("/")}>Scam awareness guides</a></p>
+          </div>
+        </div>
+      </main>
     </div>
   );
 }

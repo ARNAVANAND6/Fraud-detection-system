@@ -58,6 +58,7 @@ class TransactionEvent(BaseModel):
     # Set by the ingestion point, never trusted from an outside caller.
     source: Source | None = None
     ingested_at: datetime | None = None
+    org_id: str | None = Field(default=None, max_length=32)   # the organisation; None = "demo"
 
     @field_validator("event_time", "ingested_at")
     @classmethod

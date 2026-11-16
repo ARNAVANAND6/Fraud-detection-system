@@ -64,7 +64,7 @@ def send_capped(redis, url: str, text: str, limit: int = 10, window_s: int = 360
     if n > limit + 1:
         return False
     if n == limit + 1:
-        text = (f"VYROX: {limit} priority-1 alerts already this hour; no more messages until the hour ends. "
+        text = (f"Foresentry: {limit} priority-1 alerts already this hour; no more messages until the hour ends. "
                 "The rest are in the alert queue.")
     (post or (lambda u, t: _pool.submit(_post, u, t)))(url, text)
     return True
@@ -72,5 +72,5 @@ def send_capped(redis, url: str, text: str, limit: int = 10, window_s: int = 360
 
 def fraud_alert_text(alert: dict, dashboard_url: str) -> str:
     reasons = ", ".join(alert.get("reason_codes") or []) or "none"
-    return (f"VYROX: new P{alert['priority']} fraud alert {alert['alert_id']}, risk score "
+    return (f"Foresentry: new P{alert['priority']} fraud alert {alert['alert_id']}, risk score "
             f"{float(alert['max_risk_score']):.2f}, reasons: {reasons}. Review: {dashboard_url}")
