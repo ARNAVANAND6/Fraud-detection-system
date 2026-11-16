@@ -1283,7 +1283,7 @@ function Platform({ now }: { now: number }) {
           <div className="actions"><button className="primary" type="submit" disabled={!slugOk || !form.name.trim()}>Create</button>
             {form.org_id && !slugOk && <span className="muted small">Id: 3 to 40 lowercase letters, digits or hyphens.</span>}</div>
         </form>
-        <p className="muted">Then add the organisation's first administrator under People and audit, with this organisation id.</p>
+        <p className="muted">Then add the organisation's first administrator under Accounts, with this organisation id.</p>
       </div>
     </>
   );
