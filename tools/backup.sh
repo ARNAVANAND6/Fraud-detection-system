@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Back up the VYROX PostgreSQL database to a compressed, checksummed archive.
+# Back up the Foresentry PostgreSQL database to a compressed, checksummed archive.
 #   tools/backup.sh [output-dir]              one backup now (default dir: backups)
 # Reads PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE.
 # Archives older than BACKUP_KEEP_DAYS (default 14) are removed afterwards.

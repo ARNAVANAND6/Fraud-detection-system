@@ -235,7 +235,7 @@ def sent(client_):
 def sign(body: bytes, ts: float | None = None, secret: str = SECRET) -> dict:
     ts = str(int(ts if ts is not None else time.time()))
     sig = hmac.new(secret.encode(), ts.encode() + b"." + body, hashlib.sha256).hexdigest()
-    return {"X-Vyrox-Timestamp": ts, "X-Vyrox-Signature": f"sha256={sig}", "Content-Type": "application/json"}
+    return {"X-Foresentry-Timestamp": ts, "X-Foresentry-Signature": f"sha256={sig}", "Content-Type": "application/json"}
 
 
 def test_requires_api_key(client):
@@ -253,7 +253,7 @@ def test_rest_ingest_publishes_once_and_stamps_source(client):
     topic, key, value = sent(client)[0]
     assert topic == "demo.payments.transactions.v1" and key == "C1"
     assert value["source"] == "LIVE_API" and value["ingested_at"]
-    assert r.headers["X-Vyrox-Environment"] == "demo"
+    assert r.headers["X-Foresentry-Environment"] == "demo"
 
 
 def test_caller_cannot_choose_the_source_label(client):
@@ -330,7 +330,7 @@ def test_demo_scenario_is_labelled_simulated(client):
 def test_production_has_no_demo_scenario_and_uses_its_own_topics(prod_client):
     assert prod_client.post("/v1/demo/scenario", json={}, headers=as_user(prod_client)).status_code == 404
     r = prod_client.post("/v1/transactions", json=EVENT, headers=KEY)
-    assert r.status_code == 202 and r.headers["X-Vyrox-Environment"] == "production"
+    assert r.status_code == 202 and r.headers["X-Foresentry-Environment"] == "production"
     assert sent(prod_client)[0][0] == "production.payments.transactions.v1"
     from fraudlib.schemas import Source, TransactionEvent
     with pytest.raises(PermissionError):

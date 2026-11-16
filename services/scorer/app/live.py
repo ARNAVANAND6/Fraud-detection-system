@@ -230,13 +230,13 @@ class LiveState:
             return
         if st["stream_status"] == "DISCONNECTED":
             notify.send(self.redis, url, "disconnected",
-                        "VYROX: stream DISCONNECTED: " + "; ".join(st["reasons"]))
+                        "Foresentry: stream DISCONNECTED: " + "; ".join(st["reasons"]))
         cutoff = time.time() - 600
         for n in st["nodes"]:
             # Only nodes that stopped recently: an old, deliberately removed node is not news.
             if not n["alive"] and datetime.fromisoformat(n["last_seen"]).timestamp() > cutoff:
                 notify.send(self.redis, url, f"down:{n['kind']}:{n['id']}",
-                            f"VYROX: {n['kind']} node {n['id']} stopped reporting at {n['last_seen']}")
+                            f"Foresentry: {n['kind']} node {n['id']} stopped reporting at {n['last_seen']}")
 
     async def _stats_loop(self) -> None:
         while True:

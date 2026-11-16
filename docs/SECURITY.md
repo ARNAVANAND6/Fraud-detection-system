@@ -1,6 +1,6 @@
 # Security overview
 
-What VYROX does today to protect data and access, and what it does not do.
+What Foresentry does today to protect data and access, and what it does not do.
 Every "does" below is implemented in this repository and covered by a test or
 a recorded check. Nothing here is a certification.
 

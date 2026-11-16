@@ -9,7 +9,7 @@ while true; do
     echo "$MSG"
     if [ -n "${ALERT_WEBHOOK_URL:-}" ]; then
       wget -q -T 10 -O /dev/null --header "Content-Type: application/json" \
-        --post-data "{\"text\": \"VYROX: $MSG\"}" "$ALERT_WEBHOOK_URL" || echo "alert webhook failed"
+        --post-data "{\"text\": \"Foresentry: $MSG\"}" "$ALERT_WEBHOOK_URL" || echo "alert webhook failed"
     fi
   fi
   sleep "$((INTERVAL_HOURS * 3600))"

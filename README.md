@@ -1,4 +1,6 @@
-# VYROX: real-time payment fraud detection (v0.4)
+# Foresentry: real-time payment fraud detection (v0.5)
+
+Formerly VYROX. Internal names (Docker project `vyrox`, databases `vyrox_demo` and `vyrox_production`) are unchanged so existing data and volumes keep working.
 
 Every transaction goes through one path: ingestion gateway, Kafka, Spark
 Structured Streaming, feature store, model, PostgreSQL, alert engine, and a
@@ -6,7 +8,7 @@ push to the dashboard. Nothing on the dashboard is static, hardcoded or
 animated for effect: each figure is read from stored records or measured by
 the running system.
 
-> **What this is not.** VYROX has no connection to live UPI, bank or
+> **What this is not.** Foresentry has no connection to live UPI, bank or
 > card-network transactions. Real payment data can only arrive through an
 > authorised provider integration that the operator sets up; none is bundled.
 > The model is trained on this project's own simulator, so its accuracy
@@ -68,7 +70,7 @@ label; a caller cannot choose it.
 | `HISTORICAL_IMPORT` | `POST /v1/imports` with a CSV or Parquet file (50 MB, 500k rows) |
 | `SIMULATED_DEMO` | the built-in generator and `POST /v1/demo/scenario`, demo environment only |
 
-The webhook endpoint accepts VYROX's own envelope `{event_id, type, data}`.
+The webhook endpoint accepts Foresentry's own envelope `{event_id, type, data}`.
 A real payment gateway (Razorpay, Cashfree and so on) needs a small adapter
 that verifies that provider's signature and maps its payload to the
 transaction schema. That adapter is not written and is not claimed.

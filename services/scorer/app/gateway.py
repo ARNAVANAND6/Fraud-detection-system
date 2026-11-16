@@ -92,7 +92,7 @@ def verify_webhook(secret: str, timestamp: str | None, signature: str | None, bo
     if not secret:
         return "webhook secret is not configured"
     if not timestamp or not signature:
-        return "missing X-Vyrox-Timestamp or X-Vyrox-Signature"
+        return "missing X-Foresentry-Timestamp or X-Foresentry-Signature"
     try:
         skew = abs(time.time() - float(timestamp))
     except ValueError:

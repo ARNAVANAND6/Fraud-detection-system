@@ -212,7 +212,7 @@ def test_sso_signs_in_a_person_an_admin_added_by_email(sso_client):
 def test_sso_refuses_unknown_people_unless_their_domain_is_allowed(sso_client, monkeypatch):
     c, fake = sso_client
     frag, _ = run_sso(c, fake)
-    assert "no VYROX account" in frag["sso_error"][0]
+    assert "no Foresentry account" in frag["sso_error"][0]
     s = app.state.settings
     app.state.settings = (s.__class__(**{**s.__dict__, "oidc_allowed_domains": ("bank.example",)}))
     frag, _ = run_sso(c, fake)

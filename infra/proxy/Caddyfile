@@ -1,4 +1,4 @@
-# TLS in front of VYROX. One origin serves the dashboard and the API, so the
+# TLS in front of Foresentry. One origin serves the dashboard and the API, so the
 # browser never talks plain HTTP and no cross-origin rules are needed.
 #
 # SITE_ADDRESS=localhost (default): Caddy issues a certificate from its own

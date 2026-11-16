@@ -55,7 +55,7 @@ def match_step(secret: str, code: str, last_step: int | None, now: float | None 
     return None
 
 
-def otpauth_uri(secret: str, username: str, issuer: str = "VYROX") -> str:
+def otpauth_uri(secret: str, username: str, issuer: str = "Foresentry") -> str:
     label = quote(f"{issuer}:{username}")
     return f"otpauth://totp/{label}?secret={secret}&issuer={quote(issuer)}&digits={DIGITS}&period={STEP_S}"
 

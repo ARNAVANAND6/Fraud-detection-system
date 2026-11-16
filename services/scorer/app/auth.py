@@ -291,7 +291,7 @@ def require(*allowed: str, allow_limited: bool = False):
         who = current_principal(request, authorization, x_api_key)
         if who.limited and not allow_limited:
             raise HTTPException(status_code=403, detail="two-factor sign-in is required for your role: "
-                                                        "set it up before using VYROX")
+                                                        "set it up before using Foresentry")
         if who.role not in allowed:
             audit(request, who, "DENIED", target=f"{request.method} {request.url.path}")
             needed = " or ".join(a for a in allowed if a != SERVICE) or "an API key"

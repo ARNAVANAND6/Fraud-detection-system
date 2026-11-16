@@ -1,4 +1,4 @@
-"""VYROX API: ingestion gateway, live stream, investigation and configuration.
+"""Foresentry API: ingestion gateway, live stream, investigation and configuration.
 
 Ingestion  POST /v1/transactions          authenticated REST          -> LIVE_API
            POST /v1/webhooks/generic      HMAC-signed webhook         -> LIVE_WEBHOOK
@@ -121,7 +121,7 @@ async def lifespan(app: FastAPI):
         st.repo.close()
 
 
-app = FastAPI(title="VYROX Risk API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Foresentry Risk API", version="0.2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=list(get_settings().cors_origins),
                    allow_methods=["GET", "POST", "PATCH", "PUT"], allow_headers=["*"])
 
@@ -134,7 +134,7 @@ async def timing(request: Request, call_next):
     path = getattr(route, "path", "unmatched")
     if path != "/v1/stream":
         API_LATENCY.labels(path).observe(time.perf_counter() - t0)
-    response.headers["X-Vyrox-Environment"] = request.app.state.settings.environment
+    response.headers["X-Foresentry-Environment"] = request.app.state.settings.environment
     return response
 
 
@@ -407,13 +407,17 @@ class WebhookEnvelope(BaseModel):
 
 
 @app.post("/v1/webhooks/generic", status_code=202)
-async def webhook(request: Request, x_vyrox_timestamp: str | None = Header(default=None),
-                  x_vyrox_signature: str | None = Header(default=None)) -> dict:
-    """Signed webhook in VYROX's own envelope. A real payment gateway needs an
+async def webhook(request: Request, x_foresentry_timestamp: str | None = Header(default=None),
+                  x_foresentry_signature: str | None = Header(default=None),
+                  x_vyrox_timestamp: str | None = Header(default=None, include_in_schema=False),
+                  x_vyrox_signature: str | None = Header(default=None, include_in_schema=False)) -> dict:
+    """Signed webhook in Foresentry's own envelope. A real payment gateway needs an
     adapter that maps its payload to this schema; none is bundled or claimed."""
     body = await request.body()
     s: Settings = request.app.state.settings
-    problem = verify_webhook(s.webhook_secret, x_vyrox_timestamp, x_vyrox_signature, body)
+    # Senders set up before the rename still use the X-Vyrox-* names; both are accepted.
+    problem = verify_webhook(s.webhook_secret, x_foresentry_timestamp or x_vyrox_timestamp,
+                             x_foresentry_signature or x_vyrox_signature, body)
     if problem:
         connectors.record(request.app.state.redis, "generic", problem)
         raise HTTPException(status_code=503 if "not configured" in problem else 401, detail=problem)

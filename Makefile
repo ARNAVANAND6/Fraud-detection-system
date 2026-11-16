@@ -42,7 +42,7 @@ reconcile:        ## Bronze vs Silver vs quarantine counts
 	docker compose exec spark sh -c '/opt/spark/bin/spark-submit --conf spark.jars.ivy=/home/spark/.ivy2 --packages $$SPARK_PACKAGES reconcile.py'
 
 acceptance:       ## the ten acceptance tests against the running compose stack
-	VYROX_ACCEPTANCE=1 $(HOSTENV) $(PY) -m pytest tests/acceptance -v
+	FORESENTRY_ACCEPTANCE=1 $(HOSTENV) $(PY) -m pytest tests/acceptance -v
 
 replay-dlq:       ## summarise the dead-letter topic (see tools/replay.py for replay)
 	$(HOSTENV) $(PY) tools/replay.py dlq list
