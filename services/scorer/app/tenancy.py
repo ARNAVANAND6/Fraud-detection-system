@@ -71,6 +71,18 @@ CREATE INDEX IF NOT EXISTS alerts_org_queue_idx ON alerts (org_id, status, prior
 CREATE INDEX IF NOT EXISTS alerts_org_account_open_idx ON alerts (org_id, account_id)
     WHERE status IN ('OPEN', 'IN_REVIEW');
 
+-- DISMISSED: closed by an admin without anyone reviewing it (a stale backlog). It is not a verdict and
+-- writes no label, so it never counts as fraud or as a false positive.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'alerts'::regclass AND contype = 'c'
+                   AND pg_get_constraintdef(oid) LIKE '%DISMISSED%') THEN
+        ALTER TABLE alerts DROP CONSTRAINT IF EXISTS alerts_status_check;
+        ALTER TABLE alerts ADD CONSTRAINT alerts_status_check
+            CHECK (status IN ('OPEN', 'IN_REVIEW', 'CONFIRMED_FRAUD', 'FALSE_POSITIVE', 'DISMISSED'));
+    END IF;
+END $$;
+
 -- Machine keys issued by an organisation's administrator. Only digests are stored.
 CREATE TABLE IF NOT EXISTS api_keys (
     key_sha256    TEXT PRIMARY KEY,

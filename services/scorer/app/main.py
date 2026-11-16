@@ -34,12 +34,13 @@ from fraudlib.policy import Policy
 from fraudlib.schemas import RiskScore, Source, TransactionEvent
 from fraudlib.scoring import Scorer
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from . import auth, connectors, mfa, sso, tenancy
 from .auth import (
     Principal,
     admin_only,
+    bank_admin_only,
     can_dry_run,
     can_ingest,
     can_read,
@@ -730,6 +731,18 @@ def update_alert(alert_id: int, body: AlertUpdate, request: Request,
     auth.audit(request, who, "ALERT_UPDATE", target=str(alert_id),
                detail=body.model_dump(exclude_none=True))
     return json_response(row)
+
+
+class DismissStale(BaseModel):
+    older_than_hours: int = Field(ge=1, le=24 * 365)
+
+
+@app.post("/v1/alerts/dismiss-stale")
+def dismiss_stale(body: DismissStale, request: Request, who: Principal = Depends(bank_admin_only)) -> Response:
+    """A bank admin clears an untouched backlog. Not a verdict: no labels are written."""
+    n = request.app.state.repo.dismiss_stale(tenancy.scope(who), body.older_than_hours, who.name)
+    auth.audit(request, who, "ALERTS_DISMISS_STALE", detail={"older_than_hours": body.older_than_hours, "closed": n})
+    return json_response({"closed": n})
 
 
 # ---- organisations (SUPERADMIN) ------------------------------------------------------

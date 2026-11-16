@@ -540,8 +540,35 @@ function Overview({ stats, feed, live, source, now, onOpen, isLive }: {
 
 const NEXT: Record<AlertStatus, AlertStatus[]> = {
   OPEN: ["IN_REVIEW", "CONFIRMED_FRAUD", "FALSE_POSITIVE"], IN_REVIEW: ["CONFIRMED_FRAUD", "FALSE_POSITIVE", "OPEN"],
-  CONFIRMED_FRAUD: [], FALSE_POSITIVE: [],
+  CONFIRMED_FRAUD: [], FALSE_POSITIVE: [], DISMISSED: ["OPEN"],
 };
+const STATUS_TEXT: Record<AlertStatus, string> = {
+  OPEN: "open", IN_REVIEW: "in review", CONFIRMED_FRAUD: "confirmed fraud", FALSE_POSITIVE: "false positive",
+  DISMISSED: "closed unreviewed",
+};
+
+// A bank admin clears an untouched backlog. It is a housekeeping step, not a finding, so it writes no labels.
+function DismissStale({ onDone }: { onDone: () => void }) {
+  const [days, setDays] = useState(7);
+  const [armed, setArmed] = useState(false);
+  const [msg, setMsg] = useState("");
+  const run = async () => {
+    try { const r = await api.dismissStale(days * 24); setMsg(`Closed ${r.closed.toLocaleString("en-IN")} alerts. Each one is in its history and the audit log.`); onDone(); }
+    catch (e) { setMsg(String((e as Error).message)); }
+    setArmed(false);
+  };
+  return (
+    <div className="backlog">
+      <span>Close alerts nobody has started reviewing, with no new activity for</span>
+      <input type="number" min={1} max={365} value={days} onChange={(e) => { setDays(Math.max(1, Number(e.target.value) || 1)); setArmed(false); }} />
+      <span>days.</span>
+      {armed ? <><button className="danger" onClick={run}>Yes, close them</button><button onClick={() => setArmed(false)}>Cancel</button></>
+        : <button onClick={() => { setMsg(""); setArmed(true); }}>Close backlog</button>}
+      <span className="muted small grow">They are marked "closed unreviewed", not false positive, and the model learns nothing from them. Alerts a customer reported are kept.</span>
+      {msg && <span className="small">{msg}</span>}
+    </div>
+  );
+}
 
 function Alerts({ live, now, onOpenTxn, me }: { live: Live; now: number; onOpenTxn: (id: string) => void; me: Me }) {
   const canWork = me.role !== "VIEWER";
@@ -580,6 +607,7 @@ function Alerts({ live, now, onOpenTxn, me }: { live: Live; now: number; onOpenT
             <button className={filter === "ALL" ? "on" : ""} onClick={() => setFilter("ALL")}>All</button>
           </div>
         </div>
+        {me.role === "ADMIN" && <DismissStale onDone={() => api.alerts().then(setAlerts).catch(() => {})} />}
         {error && <div className="error">{error}</div>}
         <div className="table-wrap">
           <table data-testid="alerts">
@@ -589,7 +617,7 @@ function Alerts({ live, now, onOpenTxn, me }: { live: Live; now: number; onOpenT
               {rows.map((a) => (
                 <tr key={a.alert_id} className={`clickable ${selected === a.alert_id ? "sel" : ""}`} onClick={() => setSelected(a.alert_id)}>
                   <td><span className={`prio prio-${a.priority}`}>P{a.priority}</span></td><td>#{a.alert_id}</td>
-                  <td><span className={`status s-${a.status}`}>{a.status.replace("_", " ").toLowerCase()}</span>
+                  <td><span className={`status s-${a.status}`}>{STATUS_TEXT[a.status]}</span>
                     {a.escalation_level > 0 && <span className="esc"> escalated ×{a.escalation_level}</span>}</td>
                   <td className="mono">{a.account_id}</td><td><Chips items={a.trigger_types} /></td>
                   <td className="r">{a.max_risk_score.toFixed(3)}</td><td className="r">{a.event_count}</td>
@@ -607,7 +635,7 @@ function Alerts({ live, now, onOpenTxn, me }: { live: Live; now: number; onOpenT
             <div className="panel-head"><h3>Alert #{detail.alert_id}</h3><span className={`prio prio-${detail.priority}`}>P{detail.priority}</span></div>
             <p className="big mono">{detail.account_id}</p>
             <dl className="facts">
-              <dt>Status</dt><dd><span className={`status s-${detail.status}`}>{detail.status.replace("_", " ").toLowerCase()}</span></dd>
+              <dt>Status</dt><dd><span className={`status s-${detail.status}`}>{STATUS_TEXT[detail.status]}</span></dd>
               <dt>Assigned to</dt><dd>{detail.assigned_to ?? "nobody"}</dd>
               <dt>Transactions</dt><dd>{detail.event_count}</dd>
               <dt>Amount</dt><dd>{inr(detail.total_amount)}</dd>

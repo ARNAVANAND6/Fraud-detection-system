@@ -213,6 +213,9 @@ td.small { word-break: break-all; }
 .s-IN_REVIEW { background: var(--warning-bg); color: #8a5a12; }
 .s-CONFIRMED_FRAUD { background: var(--critical-bg); color: var(--critical); }
 .s-FALSE_POSITIVE { background: var(--good-bg); color: var(--good); }
+.s-DISMISSED { background: transparent; color: var(--muted); border: 1px dashed var(--line); }
+.backlog { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 0 12px; border-bottom: 1px solid var(--line); margin-bottom: 10px; font-size: 13px; }
+.backlog input { width: 64px; }
 .state.ok { background: var(--good-bg); color: var(--good); }
 .state.bad { background: var(--critical-bg); color: var(--critical); }
 .state.off { background: rgba(17, 20, 24, .05); color: var(--muted); }

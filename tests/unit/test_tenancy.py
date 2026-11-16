@@ -91,3 +91,17 @@ def test_a_bank_key_stamps_its_bank_on_payments_and_stops_when_revoked_or_suspen
     assert client.delete(f"/v1/api-keys/{made['key_id']}", headers=admin).status_code == 404   # not demo's key
     assert client.delete(f"/v1/api-keys/{made['key_id']}", headers=root).status_code == 204
     assert client.post("/v1/transactions", json={**EVENT, "transaction_id": "B-3"}, headers=bank_b).status_code == 401
+
+
+def test_only_a_bank_admin_closes_a_stale_backlog_and_it_is_audited(client):  # noqa: F811
+    admin, root = as_user(client), as_user(client, "root", PASSWORD)
+    body = {"older_than_hours": 24}
+    assert client.post("/v1/alerts/dismiss-stale", json=body, headers=root).status_code == 403
+    assert client.post("/v1/alerts/dismiss-stale", json={"older_than_hours": 0}, headers=admin).status_code == 422
+    r = client.post("/v1/alerts/dismiss-stale", json=body, headers=admin)
+    assert r.status_code == 200 and r.json() == {"closed": 3}
+    repo = app.state.repo
+    assert repo.alert_updates[-1] == ("dismiss", "demo", 24, "admin")
+    assert repo.audit_rows[-1]["action"] == "ALERTS_DISMISS_STALE" and repo.audit_rows[-1]["detail"]["closed"] == 3
+    # A dismissal is never set by hand on a single alert.
+    assert client.patch("/v1/alerts/1", json={"status": "DISMISSED"}, headers=admin).status_code == 422
