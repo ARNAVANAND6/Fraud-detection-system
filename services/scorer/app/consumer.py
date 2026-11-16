@@ -31,13 +31,17 @@ from fraudlib.scoring import Scorer
 from prometheus_client import start_http_server
 from pydantic import ValidationError
 
-from . import nodes, notify
+from . import nodes, notify, rollup
 from .metrics import ALERTS, EVENTS, FEATURE_SECONDS, INFERENCE_SECONDS, PIPELINE_SECONDS, RETRIES
 from .repository import Repository, connect_with_retry
 
 log = logging.getLogger("scorer")
-INFRA_ERRORS = (psycopg.OperationalError, psycopg.InterfaceError, redis.ConnectionError, redis.TimeoutError)
+# Redis out of memory is an infrastructure fault too: retry and let the backlog show on the
+# dashboard, rather than dead-letter every payment until someone notices.
+INFRA_ERRORS = (psycopg.OperationalError, psycopg.InterfaceError, redis.ConnectionError, redis.TimeoutError,
+                redis.exceptions.OutOfMemoryError)
 MAX_ATTEMPTS = 3
+BATCH = 100   # events stored per database transaction, at most
 # Commit failures that mean "this consumer left the group", not data loss.
 REJOIN_ERRORS = {KafkaError._ASSIGNMENT_LOST, KafkaError._NO_OFFSET, KafkaError.ILLEGAL_GENERATION,
                  KafkaError.UNKNOWN_MEMBER_ID, KafkaError.REBALANCE_IN_PROGRESS, KafkaError._STATE}
@@ -121,16 +125,15 @@ class ScoringWorker:
             self._last_escalation = now
 
     # ---- one event ---------------------------------------------------------------
-    def process(self, msg) -> None:
+    def score(self, msg, c, counts: rollup.Batch) -> tuple:
+        """Score one event and store it inside transaction `c`. Returns what to send once it commits."""
         try:
             event = TransactionEvent.model_validate_json(msg.value())
         except (ValidationError, ValueError) as exc:
-            self.dead_letter(msg, f"schema: {exc}")
-            return
+            return ("dead_letter", f"schema: {exc}")
         source = event.source or Source.KAFKA_STREAM
         if self.s.environment == "production" and source == Source.SIMULATED_DEMO:
-            self.dead_letter(msg, "simulated event rejected in the production environment")
-            return
+            return ("dead_letter", "simulated event rejected in the production environment")
         ts_type, ts_ms = msg.timestamp()
         ingested_at = event.ingested_at or (
             datetime.fromtimestamp(ts_ms / 1000, UTC) if ts_ms and ts_ms > 0 else datetime.now(UTC))
@@ -140,12 +143,22 @@ class ScoringWorker:
         feature_s = time.perf_counter() - t0
         score = self.scorer.score(event, features, self.policy.thresholds)
         result = self.repo.save_scored(event, source, ingested_at, score, features,
-                                       round(feature_s * 1000, 3), self.policy)
-        self.last_received_at = datetime.now(UTC)
+                                       round(feature_s * 1000, 3), self.policy, c, counts)
         if not result["inserted"]:
+            return ("duplicate",)
+        return ("scored", event, source, ingested_at, score, feature_s, result)
+
+    def publish(self, msg, out: tuple) -> None:
+        """After the commit: metrics, the scored event for dashboards, alerts and notifications."""
+        self.last_received_at = datetime.now(UTC)
+        if out[0] == "dead_letter":
+            self.dead_letter(msg, out[1])
+            return
+        if out[0] == "duplicate":
             EVENTS.labels("duplicate").inc()
             self.duplicates += 1
             return
+        _, event, source, ingested_at, score, feature_s, result = out
         row, alert = result["row"], result["alert"]
         FEATURE_SECONDS.observe(feature_s)
         INFERENCE_SECONDS.observe((score.latency_ms or 0) / 1000)
@@ -170,6 +183,38 @@ class ScoringWorker:
             if alert["is_new"] and alert["priority"] == 1:
                 notify.send_capped(self.redis, self.s.alert_webhook_url,
                                    notify.fraud_alert_text(alert, self.s.dashboard_url))
+
+    def process(self, msg) -> None:
+        """One event in its own transaction."""
+        counts = rollup.Batch()
+        with self.repo.pool.connection() as c, c.transaction():
+            out = self.score(msg, c, counts)
+            counts.flush(c)
+        self.publish(msg, out)
+
+    def process_batch(self, msgs: list) -> None:
+        """Up to BATCH events in one transaction: one commit (one disk flush) instead of one each.
+
+        If anything in the batch fails, nothing of it is kept and each event is retried in its own
+        transaction, so one bad event never holds back the others. Replaying is safe: Redis
+        history and PostgreSQL rows are keyed on transaction_id.
+        """
+        if len(msgs) == 1:
+            self.process_with_retry(msgs[0])
+            return
+        counts = rollup.Batch()
+        try:
+            with self.repo.pool.connection() as c, c.transaction():
+                outs = [self.score(m, c, counts) for m in msgs]
+                counts.flush(c)
+        except Exception as exc:  # noqa: BLE001 - fall back to one at a time, which has the retry policy
+            RETRIES.labels("batch").inc()
+            log.warning("batch failed, storing one at a time", extra={"error": str(exc)[:200], "size": len(msgs)})
+            for m in msgs:
+                self.process_with_retry(m)
+            return
+        for m, out in zip(msgs, outs, strict=True):
+            self.publish(m, out)
 
     def process_with_retry(self, msg) -> None:
         attempt, backoff = 0, 1.0
@@ -223,7 +268,8 @@ class ScoringWorker:
             # Short wait: consume() returns when it has 200 messages or the timeout
             # passes, so the timeout is added latency at low volume (0.25 s here
             # measured as a 237 ms end-to-end P50 in direct mode).
-            msgs = self.consumer.consume(num_messages=200, timeout=0.02)
+            msgs = self.consumer.consume(num_messages=BATCH, timeout=0.02)
+            payments = []
             for msg in msgs:
                 if msg.error():
                     if msg.error().code() != KafkaError._PARTITION_EOF:
@@ -237,7 +283,9 @@ class ScoringWorker:
                     except (ValueError, KeyError):
                         pass
                     continue
-                self.process_with_retry(msg)
+                payments.append(msg)
+            if payments:
+                self.process_batch(payments)
             if msgs and self.running:
                 self.producer.flush(10)
                 self.commit()

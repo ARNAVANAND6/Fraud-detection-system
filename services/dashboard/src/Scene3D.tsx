@@ -60,8 +60,8 @@ export function Scene3D({ feed, isLive, frozenAt, clockOffset, thresholds, onOpe
     // World box: x in [-1, 1] (amount), y in [0, 1] (risk), z in [0, 1] (age, 0 = now).
     const project = (x: number, y: number, z: number) => {
       const s = state.current;
-      // Pointer right turns the scene right; pointer up tips the top of the scene towards the viewer.
-      const yaw = -0.42 + s.tiltX * 0.60, pitch = 0.30 - s.tiltY * 0.26;
+      // Reversed on request: pointer right turns the scene left, pointer up tips the top away from the viewer.
+      const yaw = -0.42 - s.tiltX * 0.60, pitch = 0.30 + s.tiltY * 0.26;
       x *= 1.7;
       const zc = (z - 0.5) * 3.0, yc = (y - 0.5) * 0.9;
       const x1 = x * Math.cos(yaw) - zc * Math.sin(yaw);

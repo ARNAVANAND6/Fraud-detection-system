@@ -6,7 +6,15 @@
 # SITE_ADDRESS=risk.example.com: Caddy obtains and renews a public certificate
 #   automatically. Ports 80 and 443 must be reachable from the internet.
 {$SITE_ADDRESS:localhost} {
-	encode zstd gzip
+	# Compress pages and JSON, never the live stream: a compressor holds small events back
+	# until its buffer fills, so the console would see nothing and keep reconnecting.
+	encode {
+		zstd
+		gzip
+		match {
+			header Content-Type text/html* text/css* text/plain* text/javascript* application/javascript* application/json* image/svg+xml*
+		}
+	}
 
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"

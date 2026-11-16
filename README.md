@@ -288,10 +288,12 @@ windows of steady state, measured from stored rows
 | Stored to browser (clock offset removed) | 8 / 55 / 78 ms (one browser, 526 samples) | not re-measured |
 | REST request to Kafka acknowledgement | 1.2 / 4.2 / 4.2 ms (12 samples only) | not re-measured |
 
-Maximum throughput, measured on 15 Nov 2026 with `tools/loadtest.py` (a burst of 30,000 events, then
-the backlog's drain rate): **251.7 events per second** on the same 4-core sandbox, direct mode, one
-scorer process (`reports/loadtest.json`). The scorer handles one event at a time with one database
-transaction each; that is the limit. It is a measurement of that machine, not a promise for another.
+Maximum throughput, measured on 16 Nov 2026 with `tools/loadtest.py` on the same 4-core sandbox, direct mode,
+with everything on that one machine: **298 payments per second with one scorer, 590 with two, 701 with four**.
+These runs started with an empty Redis, so account histories were short. With long histories (about 700
+payments per account), one scorer managed 160 per second and four managed 436. The four cores were the limit.
+Details and what changed are in docs/DEPLOYMENT.md under "Capacity". These are measurements of that machine,
+not a promise for another.
 
 Three things the measurements changed:
 
@@ -331,10 +333,10 @@ the training data.
 
 - Razorpay and Stripe webhook adapters are built and tested with documented payloads, not with a live account. No UPI switch, bank or card-network feed. Gateway payments carry no balances, so they are scored mainly by the rules (docs/INTEGRATION.md).
 - Each API process runs one worker. For more capacity or failover run more API processes (docker-compose.ha.yml); each gets live events from Kafka itself.
-- Dashboard analytics run aggregate queries over the whole `predictions` table every 2 seconds. Fine for a demo, not for millions of rows.
+- Model accuracy against labels is still recounted over all labelled payments, at most once a minute.
 - The fan-in feature shares state across accounts; with several scorer replicas two senders to one destination scored at the same instant can miss each other.
 - The risk score is an uncalibrated model probability.
-- Not proven at national scale. Two or more API and scorer processes run side by side, but Kafka, Redis and PostgreSQL are single containers and nothing has been load-tested beyond one machine (see Measured performance). Organisations share one database, separated by `org_id` in every query, not by separate databases or row-level security.
+- Not proven at national scale. Throughput was measured up to four scorer processes on one 4-core machine (701 payments per second). Kafka, Redis and PostgreSQL are single containers, and no test has used several machines. docs/DEPLOYMENT.md lists what a national-scale test still needs. Organisations share one database, separated by `org_id` in every query, not by separate databases or row-level security.
 - The scam-awareness guides on the home page are general guidance written for this project. Have them checked by banking or compliance staff before publishing them under an organisation's name.
 - No SAML single sign-on (OpenID Connect only) and no hardware security keys.
 - API and scorer run two or more of each (docker-compose.ha.yml, failover measured in docs/DEPLOYMENT.md), but Kafka, Redis and PostgreSQL as shipped are one container each. No encryption at rest, no TLS between the internal services.

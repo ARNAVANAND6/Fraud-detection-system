@@ -46,10 +46,10 @@ async function send(id) {
   const pill = page.getByTestId("stream-pill");
   await pill.filter({ hasText: /LIVE|IDLE/ }).waitFor({ timeout: 20000 });
   check("signed-in user and role are shown", (await page.getByTestId("who").innerText()).includes(USER));
-  check("environment badge is shown", await page.locator(".env").innerText().then((t) => /DEMO|PRODUCTION/.test(t)));
+  check("environment badge is shown", await page.locator(".env").innerText().then((t) => /demo|production/i.test(t)));
 
   const processed0 = await page.getByTestId("kpi-processed").innerText();
-  await page.locator("header select").selectOption("LIVE_API"); // the generator is busy; watch the REST source
+  await page.getByTestId("source-filter").selectOption("LIVE_API"); // the generator is busy; watch the REST source
   await page.waitForTimeout(1500);
   // 1 + 6: a new transaction shows up in the feed with no reload and no click.
   const before = navigations;
@@ -58,7 +58,7 @@ async function send(id) {
   await send(id1);
   await page.locator("table[data-testid=feed]").getByText(id1).waitFor({ timeout: 20000 });
   check("transaction appears in the live feed", true, `${Date.now() - t0} ms after the POST`);
-  await page.locator("header select").selectOption("");
+  await page.getByTestId("source-filter").selectOption("");
   await page.waitForFunction((v) => document.querySelector("[data-testid=kpi-processed]").innerText !== v, processed0, { timeout: 15000 });
   check("KPIs changed with no page reload", navigations === before, `navigations during the test: ${navigations - before}`);
   await page.screenshot({ path: `${dir}/1-live.png` });
@@ -72,7 +72,7 @@ async function send(id) {
   check("banner explains the outage", /heartbeat missing/.test(banner) && /stored records/.test(banner));
   check("feed is no longer titled live", await page.getByText("Transaction feed (not live)").isVisible());
   check("content is dimmed while not live", await page.locator("main.stale").count() === 1);
-  await page.locator("header select").selectOption("LIVE_API");
+  await page.getByTestId("source-filter").selectOption("LIVE_API");
   const id2 = `TXN_BROWSER_${Date.now().toString(36)}_held`;
   await send(id2);
   await page.waitForTimeout(4000);
@@ -99,7 +99,7 @@ async function send(id) {
   check("page reconnects by itself, no reload", navigations === before);
 
   // 7. Model health: the drift panel shows a real comparison, or says plainly why it cannot.
-  await page.locator("nav.tabs button", { hasText: /performance/i }).click();
+  await page.locator("nav.tabs button", { hasText: /performance|health/i }).click();
   const health = page.getByTestId("model-health");
   await health.getByText(/Overall:|Not enough|no training reference/i).first().waitFor({ timeout: 15000 });
   await page.screenshot({ path: `${dir}/5-model-health.png`, fullPage: true });

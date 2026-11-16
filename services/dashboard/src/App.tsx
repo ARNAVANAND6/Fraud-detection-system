@@ -10,38 +10,52 @@ import { Scene3D } from "./Scene3D";
 import { onNav } from "./router";
 import { BANNER_TIPS, HELPLINE, REPORT_URL } from "./home/content";
 
-type Tab = "platform" | "overview" | "alerts" | "check" | "performance" | "integrations" | "ingest" | "settings" | "admin" | "security";
-// What each role sees. The server enforces the same rules; this only hides what would be refused.
-// CUSTOMER never reaches the console: account holders get their own portal (CustomerPortal).
-const TABS: Record<Role, Tab[]> = {
-  VIEWER: ["overview", "alerts", "performance", "integrations", "security"],
-  ANALYST: ["overview", "alerts", "check", "performance", "integrations", "security"],
-  // Risk settings apply to every organisation, so only the platform operator changes them.
-  ADMIN: ["overview", "alerts", "check", "performance", "integrations", "ingest", "admin", "security"],
-  SUPERADMIN: ["platform", "overview", "alerts", "performance", "integrations", "settings", "admin", "security"],
-  CUSTOMER: [],
+type Tab = "platform" | "health" | "overview" | "live" | "alerts" | "check" | "model" | "integrations" | "ingest" | "settings"
+  | "people" | "keys" | "audit" | "security";
+
+// Each kind of person gets a console built for their job. The server enforces the same rules; this only
+// decides what to show. Account holders (CUSTOMER) never reach these: they get CustomerPortal.
+type Kind = "operator" | "bank" | "desk";
+const KIND_OF: Record<Exclude<Role, "CUSTOMER">, Kind> = { SUPERADMIN: "operator", ADMIN: "bank", ANALYST: "desk", VIEWER: "desk" };
+
+interface ConsoleSpec { name: string; home: Tab; groups: { label?: string; tabs: Tab[] }[]; labels: Partial<Record<Tab, string>> }
+const CONSOLES: Record<Kind, ConsoleSpec> = {
+  // The platform operator looks after banks and the system, not individual payments.
+  operator: {
+    name: "Operations", home: "platform",
+    groups: [{ tabs: ["platform", "health", "settings", "people", "audit"] }],
+    labels: { platform: "Banks", health: "System health", settings: "Risk policy", people: "Accounts", audit: "Activity log" },
+  },
+  // A bank's administrator runs their team, keys and data feeds, and keeps an eye on the queue.
+  bank: {
+    name: "Administration", home: "overview",
+    groups: [
+      { label: "Your bank", tabs: ["overview", "alerts"] },
+      { label: "Access", tabs: ["people", "keys", "audit"] },
+      { label: "Data", tabs: ["integrations", "ingest", "health"] },
+    ],
+    labels: { overview: "Summary", alerts: "Fraud queue", people: "Team", keys: "API keys", audit: "Audit log",
+              integrations: "Connections", ingest: "Data intake", health: "Pipeline health" },
+  },
+  // Analysts and viewers work cases. The queue is the first thing they see.
+  desk: {
+    name: "Case desk", home: "alerts",
+    groups: [{ tabs: ["alerts", "live", "check", "model"] }],
+    labels: { alerts: "Cases", live: "Live payments", check: "Check a payment", model: "Model health" },
+  },
 };
-const NAV: { group: string; tabs: Tab[] }[] = [
-  { group: "Platform", tabs: ["platform"] },
-  { group: "Monitor", tabs: ["overview", "alerts", "check"] },
-  { group: "System", tabs: ["performance", "integrations"] },
-  { group: "Administration", tabs: ["ingest", "settings", "admin"] },
-];
-const TAB_LABEL: Record<Tab, string> = {
-  platform: "Organisations", overview: "Overview", alerts: "Alerts", check: "Check a transaction", performance: "Performance",
-  integrations: "Integrations", ingest: "Data intake", settings: "Settings", admin: "People and audit", security: "Security",
+const DEFAULT_LABEL: Record<Tab, string> = {
+  platform: "Banks", health: "System health", overview: "Overview", live: "Live payments", alerts: "Alerts",
+  check: "Check a payment", model: "Model health", integrations: "Integrations", ingest: "Data intake", settings: "Settings",
+  people: "People", keys: "API keys", audit: "Audit log", security: "Your account",
 };
-const TAB_INTRO: Record<Tab, string> = {
-  platform: "Every organisation on this platform: create, rename and suspend. Their data stays theirs.",
-  overview: "Scored transactions, as stored by the pipeline.",
-  alerts: "Work the queue. Every change is recorded in the audit log under your name.",
-  check: "Score one transaction against the live model and feature store. Nothing is stored.",
-  performance: "Latency, throughput and model health, measured by the running system.",
-  integrations: "Where transactions come from, and whether each source is delivering.",
-  ingest: "Send test data through the same pipeline as production traffic.",
-  settings: "Risk thresholds and alert rules. Changes apply within about 5 seconds.",
-  admin: "Who can sign in, what they may do, and what they did.",
-  security: "Your own sign-in settings.",
+const TAB_INTRO: Partial<Record<Tab, string>> = {
+  platform: "Banks on this platform. Each one sees only its own data.",
+  health: "Processes, latency, throughput and model drift, as measured by the running system.",
+  settings: "Thresholds and alert rules for every bank. Changes apply within about 5 seconds.",
+  check: "Score one payment against the live model. Nothing is stored.",
+  ingest: "Send test data through the same pipeline as real traffic.",
+  integrations: "Where payments come from, and whether each source is delivering.",
 };
 type Health = "live" | "idle" | "delayed" | "disconnected" | "offline" | "connecting";
 
@@ -210,7 +224,9 @@ function SignIn({ onSignedIn, initialError }: { onSignedIn: (me: Me) => void; in
 // ---- console shell --------------------------------------------------------------------
 
 function Console({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
-  const [tab, setTab] = useState<Tab>(me.role === "SUPERADMIN" ? "platform" : "overview");
+  const kind = KIND_OF[me.role as Exclude<Role, "CUSTOMER">] ?? "desk";
+  const spec = CONSOLES[kind];
+  const [tab, setTab] = useState<Tab>(spec.home);
   const [source, setSource] = useState<Source | null>(null);
   const seed = useCallback(() => api.recent(500, null), []);
   const live = useLive(seed);
@@ -231,103 +247,136 @@ function Console({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const feed = useMemo(() => (source ? live.feed.filter((t) => t.source === source) : live.feed), [live.feed, source]);
   const env = st?.environment;
   const perf = live.stats?.performance;
-  const allowed = TABS[me.role];
+  const label = (t: Tab) => spec.labels[t] ?? DEFAULT_LABEL[t];
+  const a = live.stats?.alerts;
+  const showSource = tab === "overview" || tab === "live";
 
-  return (
-    <div className="shell">
-      <aside className="side glass">
-        <div className="side-brand">
-          <span className="mark" aria-hidden>F</span>
-          <span className="side-name">FORESENTRY</span>
-        </div>
-        {me.org_name && <div className="side-org" title={`Organisation ${me.org_id}`}>{me.org_name}</div>}
-        {me.role === "SUPERADMIN" && <div className="side-org">Platform operator</div>}
-        <div className={`env env-${env ?? "unknown"}`} title="Environment of the server this dashboard is connected to">
-          {env === "demo" ? "DEMO · simulated data" : env === "production" ? "PRODUCTION" : "ENVIRONMENT UNKNOWN"}
-        </div>
-        <nav className="tabs" aria-label="Sections">
-          {NAV.map((g) => {
-            const items = g.tabs.filter((t) => allowed.includes(t));
-            if (!items.length) return null;
-            return (
-              <div className="nav-group" key={g.group}>
-                <div className="nav-label">{g.group}</div>
-                {items.map((t) => (
-                  <button key={t} className={tab === t ? "on" : ""} aria-current={tab === t ? "page" : undefined} onClick={() => setTab(t)}>
-                    <span>{TAB_LABEL[t]}</span>
-                    {t === "alerts" && live.stats ? <span className="count">{num(live.stats.alerts.open)}</span> : null}
-                  </button>
-                ))}
-              </div>
-            );
-          })}
-        </nav>
-        <div className="side-foot">
-          <button className={`side-link ${tab === "security" ? "on" : ""}`} onClick={() => setTab("security")}>Security</button>
-          <div className="who" data-testid="who" title={`Signed in as ${me.username}`}>
-            <span className="avatar" aria-hidden>{me.username.slice(0, 1).toUpperCase()}</span>
-            <span className="who-text"><b>{me.username}</b><span className="muted">{me.role.toLowerCase()}</span></span>
-            <button className="ghost" onClick={onSignOut}>Sign out</button>
-          </div>
-        </div>
-      </aside>
+  const navItem = (t: Tab) => (
+    <button key={t} className={tab === t ? "on" : ""} aria-current={tab === t ? "page" : undefined} onClick={() => setTab(t)}>
+      <span>{label(t)}</span>
+      {t === "alerts" && a ? <span className="count">{num(a.open + a.in_review)}</span> : null}
+    </button>
+  );
+  const account = (
+    <div className="who" data-testid="who" title={`Signed in as ${me.username}`}>
+      <button className={`ghost ${tab === "security" ? "on-text" : ""}`} onClick={() => setTab("security")}>{me.username}</button>
+      <span className="muted small">{ROLE_NAME[me.role]}</span>
+      <button className="ghost" onClick={onSignOut}>Sign out</button>
+    </div>
+  );
+  const envTag = (
+    <span className={`env env-${env ?? "unknown"}`} title="Environment of the server this console is connected to">
+      {env === "demo" ? "Demo, simulated data" : env === "production" ? "Production" : "Environment unknown"}
+    </span>
+  );
 
-      <div className="content">
-        <header className="topbar">
-          <div className="crumbs">
-            <span className="muted">{me.role === "SUPERADMIN" ? "All organisations" : me.org_name ?? "Workspace"}</span>
-            <span className="sep">/</span><h2>{TAB_LABEL[tab]}</h2>
-            <p className="intro muted">{TAB_INTRO[tab]}</p>
-          </div>
-          <label className="filter">Data source
-            <select value={source ?? ""} onChange={(e) => setSource((e.target.value || null) as Source | null)}>
+  const body = (
+    <>
+      <div className="page-head">
+        <h1>{label(tab)}</h1>
+        {TAB_INTRO[tab] && <p className="muted">{TAB_INTRO[tab]}</p>}
+        <div className="grow" />
+        {showSource && (
+          <label className="filter">Source
+            <select data-testid="source-filter" value={source ?? ""} onChange={(e) => setSource((e.target.value || null) as Source | null)}>
               <option value="">All sources</option>
               {(Object.keys(SOURCE_LABEL) as Source[]).map((s) => <option key={s} value={s}>{SOURCE_LABEL[s]}</option>)}
             </select>
           </label>
-          <div className={`pill pill-${h.state}`} data-testid="stream-pill"><span className="dot" aria-hidden /> {h.title}</div>
-        </header>
-
-        <section className="statusbar" data-testid="statusbar">
-          <Fact label="Stream status" value={st && live.conn === "connected" ? st.stream_status : "UNKNOWN"} testid="stream-status" />
-          <Fact label="Connection" testid="connection"
-                value={live.conn === "connected" ? "Connected" : live.conn === "connecting" ? "Connecting" : "Disconnected"}
-                sub={live.conn === "connected" ? `last message ${live.lastMessageAt ? ago(new Date(live.lastMessageAt).toISOString(), now) : "never"}` : `retrying, ${live.reconnects} attempts`} />
-          <Fact label="Data source" value={st?.active_sources.length ? st.active_sources.map((s) => SOURCE_LABEL[s]).join(", ") : "none active"}
-                sub="sources with events in the last minute" />
-          <Fact label="Last event" value={clock(st?.last_event_at)} sub={ago(st?.last_event_at, now)} testid="last-event" />
-          <Fact label="Last inference" value={clock(st?.last_inference_at)} sub={st?.model_version ? `model ${st.model_version}` : "model unknown"} />
-          <Fact label="Processing latency" value={perf?.pipeline_ms ? ms(perf.pipeline_ms.p50) : "n/a"}
-                sub={perf?.pipeline_ms ? `P50, ingest to stored, last ${perf.window_minutes} min` : "no events in the last 5 min"} />
-        </section>
-
-        {h.state !== "live" && (
-          <div className={`banner banner-${h.state}`} role="status" data-testid="banner">
-            <b>{h.title}.</b> {h.detail}
-          </div>
         )}
-
-        <main className={h.state === "live" ? "" : "stale"}>
-          {tab === "platform" && <Platform now={now} />}
-          {tab === "overview" && <Overview stats={stats} feed={feed} live={live} source={source} now={now} onOpen={setOpenTxn} isLive={h.state === "live"} />}
-          {tab === "alerts" && <Alerts live={live} now={now} onOpenTxn={setOpenTxn} me={me} />}
-          {tab === "check" && <CheckTransaction />}
-          {tab === "performance" && <PerformanceTab live={live} now={now} />}
-          {tab === "integrations" && <Integrations now={now} />}
-          {tab === "ingest" && <Ingest env={env} />}
-          {tab === "settings" && <Settings />}
-          {tab === "admin" && <Admin me={me} />}
-          {tab === "security" && <Security me={me} />}
-        </main>
-        {openTxn && <TxnDrawer id={openTxn} onClose={() => setOpenTxn(null)} />}
-        <footer>
-          Risk scores are model estimates on {env === "production" ? "ingested" : "simulated"} data, not banking or regulatory decisions.
-          Every figure on this page is read from stored records or measured by the running system.
-        </footer>
       </div>
+      {h.state !== "live" && (
+        <div className={`banner banner-${h.state}`} role="status" data-testid="banner"><b>{h.title}.</b> {h.detail}</div>
+      )}
+      <main className={h.state === "live" ? "" : "stale"}>
+        {tab === "platform" && <Platform now={now} />}
+        {tab === "health" && <PerformanceTab live={live} now={now} />}
+        {(tab === "overview" || tab === "live") &&
+          <Overview stats={stats} feed={feed} live={live} source={source} now={now} onOpen={setOpenTxn} isLive={h.state === "live"} />}
+        {tab === "alerts" && <Alerts live={live} now={now} onOpenTxn={setOpenTxn} me={me} />}
+        {tab === "check" && <CheckTransaction />}
+        {tab === "model" && <ModelHealth />}
+        {tab === "integrations" && <Integrations now={now} />}
+        {tab === "ingest" && <Ingest env={env} />}
+        {tab === "settings" && <Settings />}
+        {tab === "people" && <People me={me} />}
+        {tab === "keys" && <ApiKeys />}
+        {tab === "audit" && <AuditLog me={me} />}
+        {tab === "security" && <Security me={me} />}
+      </main>
+      {openTxn && <TxnDrawer id={openTxn} onClose={() => setOpenTxn(null)} />}
+      <footer>
+        Risk scores are model estimates on {env === "production" ? "ingested" : "simulated"} data. They are not banking or
+        regulatory decisions.
+      </footer>
+    </>
+  );
+
+  // A one-line reading of the pipeline, so stale data is never mistaken for live.
+  const statusLine = (
+    <div className="statusline" data-testid="statusbar">
+      <span className={`pill pill-${h.state}`} data-testid="stream-pill"><span className="dot" aria-hidden /> {h.title}</span>
+      <span data-testid="stream-status" className="sr-only">{st && live.conn === "connected" ? st.stream_status : "UNKNOWN"}</span>
+      <span data-testid="connection">{live.conn === "connected" ? "Connected" : live.conn === "connecting" ? "Connecting" : `Disconnected, retry ${live.reconnects}`}</span>
+      <span data-testid="last-event">Last payment {clock(st?.last_event_at)} <span className="muted">({ago(st?.last_event_at, now)})</span></span>
+      <span>Median latency {perf?.pipeline_ms ? ms(perf.pipeline_ms.p50) : "n/a"}</span>
+      {kind === "operator" && st?.nodes && <span>{st.nodes.filter((n) => n.alive).length} of {st.nodes.length} processes up</span>}
+      {kind !== "operator" && <span className="muted">Sources: {st?.active_sources.length ? st.active_sources.map((s) => SOURCE_LABEL[s]).join(", ") : "none in the last minute"}</span>}
+    </div>
+  );
+
+  if (kind === "bank") {
+    return (
+      <div className="shell console-bank">
+        <aside className="side">
+          <div className="side-brand"><span className="mark" aria-hidden>F</span><span>Foresentry</span></div>
+          <div className="side-org" title={`Organisation ${me.org_id}`}>{me.org_name ?? me.org_id}</div>
+          <div className="side-sub">{spec.name}</div>
+          {envTag}
+          <nav className="tabs" aria-label="Sections">
+            {spec.groups.map((g) => (
+              <div className="nav-group" key={g.label}>
+                {g.label && <div className="nav-label">{g.label}</div>}
+                {g.tabs.map(navItem)}
+              </div>
+            ))}
+          </nav>
+          <div className="side-foot">{account}</div>
+        </aside>
+        <div className="content">{statusLine}{body}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`top-shell console-${kind}`}>
+      <header className="masthead">
+        <div className="mast-row">
+          <span className="side-brand"><span className="mark" aria-hidden>F</span><span>Foresentry</span></span>
+          <span className="mast-name">{spec.name}{kind === "desk" && me.org_name ? <span className="muted"> · {me.org_name}</span> : null}</span>
+          {envTag}
+          <div className="grow" />
+          {account}
+        </div>
+        <nav className="tabs tabs-row" aria-label="Sections">{spec.groups.flatMap((g) => g.tabs).map(navItem)}</nav>
+      </header>
+      {kind === "desk" && (
+        <div className="desk-counts" data-testid="desk-counts">
+          <span><b>{a ? num(a.open) : "–"}</b> waiting</span>
+          <span><b>{a ? num(a.in_review) : "–"}</b> in review</span>
+          <span className={a?.sla_breached ? "overdue" : ""}><b>{a ? num(a.sla_breached) : "–"}</b> past their deadline</span>
+          <span><b>{a ? num(a.escalated) : "–"}</b> escalated</span>
+          {me.role === "VIEWER" && <span className="muted">You can read cases but not change them.</span>}
+        </div>
+      )}
+      <div className="top-body">{statusLine}{body}</div>
     </div>
   );
 }
+
+const ROLE_NAME: Record<Role, string> = {
+  SUPERADMIN: "platform operator", ADMIN: "administrator", ANALYST: "analyst", VIEWER: "viewer", CUSTOMER: "account holder",
+};
 
 function Fact({ label, value, sub, testid }: { label: string; value: string; sub?: string; testid?: string }) {
   return (
@@ -497,7 +546,7 @@ const NEXT: Record<AlertStatus, AlertStatus[]> = {
 function Alerts({ live, now, onOpenTxn, me }: { live: Live; now: number; onOpenTxn: (id: string) => void; me: Me }) {
   const canWork = me.role !== "VIEWER";
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [filter, setFilter] = useState<"ACTIVE" | "ALL">("ACTIVE");
+  const [filter, setFilter] = useState<"ACTIVE" | "MINE" | "ALL">("ACTIVE");
   const [selected, setSelected] = useState<number | null>(null);
   const [detail, setDetail] = useState<AlertDetail | null>(null);
   const [error, setError] = useState("");
@@ -512,7 +561,8 @@ function Alerts({ live, now, onOpenTxn, me }: { live: Live; now: number; onOpenT
     try { setError(""); await api.updateAlert(id, body); setAlerts(await api.alerts()); if (selected === id) setDetail(await api.alert(id)); }
     catch (e) { setError(String((e as Error).message)); }
   };
-  const rows = alerts.filter((a) => filter === "ALL" || a.status === "OPEN" || a.status === "IN_REVIEW");
+  const active = (a: Alert) => a.status === "OPEN" || a.status === "IN_REVIEW";
+  const rows = alerts.filter((a) => filter === "ALL" || (active(a) && (filter === "ACTIVE" || a.assigned_to === me.username)));
   const sla = (a: Alert) => {
     if (a.status !== "OPEN") return "n/a";
     const left = (Date.parse(a.sla_due_at) - now) / 1000;
@@ -526,6 +576,7 @@ function Alerts({ live, now, onOpenTxn, me }: { live: Live; now: number; onOpenT
           <span className="muted small grow">sorted by priority; one alert per account while it stays open</span>
           <div className="seg">
             <button className={filter === "ACTIVE" ? "on" : ""} onClick={() => setFilter("ACTIVE")}>Open and in review</button>
+            {canWork && <button className={filter === "MINE" ? "on" : ""} onClick={() => setFilter("MINE")}>Assigned to me</button>}
             <button className={filter === "ALL" ? "on" : ""} onClick={() => setFilter("ALL")}>All</button>
           </div>
         </div>
@@ -990,11 +1041,11 @@ function Settings() {
 
 const ORG_ROLES: Role[] = ["VIEWER", "ANALYST", "ADMIN", "CUSTOMER"];
 
-function Admin({ me }: { me: Me }) {
+function People({ me }: { me: Me }) {
   const platform = me.role === "SUPERADMIN";
+  // Only a superadmin can add another; nobody can be promoted to it later.
   const ROLES: Role[] = platform ? [...ORG_ROLES, "SUPERADMIN"] : ORG_ROLES;
   const [users, setUsers] = useState<User[]>([]);
-  const [audit, setAudit] = useState<AuditRow[]>([]);
   const [msg, setMsg] = useState("");
   const [form, setForm] = useState({ username: "", password: "", role: "ANALYST" as Role, org_id: "", accounts: "" });
   const extra = () => ({
@@ -1004,7 +1055,7 @@ function Admin({ me }: { me: Me }) {
   const formReady = form.username && form.password.length >= 10
     && (form.role !== "CUSTOMER" || form.accounts.trim()) && (!platform || form.role === "SUPERADMIN" || form.org_id.trim());
   const load = useCallback(() => {
-    Promise.all([api.users(), api.audit()]).then(([u, a]) => { setUsers(u); setAudit(a); }).catch((e) => setMsg(String(e.message)));
+    api.users().then(setUsers).catch((e) => setMsg(String(e.message)));
   }, []);
   useEffect(load, [load]);
   const run = async (what: string, fn: () => Promise<unknown>) => {
@@ -1013,9 +1064,9 @@ function Admin({ me }: { me: Me }) {
   };
   const reportsMfa = users.some((u) => u.mfa_enabled !== undefined);
   return (
-    <div className="grid2">
+    <div className="grid2 wide-left">
       <div className="panel">
-        <div className="panel-head"><h3>People</h3><span className="muted small">who can sign in, and what they may do</span></div>
+        <div className="panel-head"><h3>{platform ? "Everyone with a sign-in" : "Your team and account holders"}</h3></div>
         {msg && <div className="notice" role="status">{msg}</div>}
         <table data-testid="users">
           <thead><tr><th>Username</th>{platform && <th>Organisation</th>}<th>Role</th>{reportsMfa && <th>Sign-in</th>}<th>Status</th><th></th></tr></thead>
@@ -1027,7 +1078,7 @@ function Admin({ me }: { me: Me }) {
               <td>
                 <select value={u.role} aria-label={`Role of ${u.username}`}
                         onChange={(e) => run(`Role of ${u.username}`, () => api.changeUser(u.username, { role: e.target.value as Role }))}>
-                  {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+                  {(u.role === "SUPERADMIN" ? ["SUPERADMIN" as Role] : ORG_ROLES).map((r) => <option key={r} value={r}>{ROLE_NAME[r]}</option>)}
                 </select>
               </td>
               {reportsMfa && (
@@ -1049,7 +1100,9 @@ function Admin({ me }: { me: Me }) {
             </tr>
           ))}</tbody>
         </table>
-        <h4>Add a person</h4>
+      </div>
+      <div className="panel">
+        <div className="panel-head"><h3>Add a person</h3></div>
         <form className="form" onSubmit={(e) => { e.preventDefault(); run(`Add ${form.username}`, async () => {
           await api.createUser(form.username, form.password, form.role, extra());
           setForm({ username: "", password: "", role: "ANALYST", org_id: form.org_id, accounts: "" }); }); }}>
@@ -1058,7 +1111,7 @@ function Admin({ me }: { me: Me }) {
             <input type="password" autoComplete="new-password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></label>
           <label>Role
             <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as Role })}>
-              {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+              {ROLES.map((r) => <option key={r} value={r}>{ROLE_NAME[r]}</option>)}
             </select></label>
           {platform && form.role !== "SUPERADMIN" && (
             <label>Organisation id<input value={form.org_id} placeholder="demo" onChange={(e) => setForm({ ...form, org_id: e.target.value })} /></label>
@@ -1068,14 +1121,30 @@ function Admin({ me }: { me: Me }) {
           )}
           <div className="actions"><button className="primary" type="submit" disabled={!formReady}>Add person</button></div>
         </form>
-        <p className="muted">Viewer: read only. Analyst: can also work alerts. Admin: can also change settings, import data and manage people.
-          Customer: an account holder who sees only their own payments and can report one. Changing a role or deactivating someone
-          signs them out everywhere.</p>
-        {me.role === "ADMIN" && <ApiKeys />}
+        <dl className="facts small">
+          <dt>Viewer</dt><dd>reads cases and payments</dd>
+          <dt>Analyst</dt><dd>also works cases</dd>
+          <dt>Administrator</dt><dd>also manages the team, API keys and data intake</dd>
+          <dt>Account holder</dt><dd>sees only their own payments and can report one</dd>
+        </dl>
+        <p className="note">Changing a role or deactivating someone signs them out everywhere.</p>
       </div>
+    </div>
+  );
+}
+
+function AuditLog({ me }: { me: Me }) {
+  const [audit, setAudit] = useState<AuditRow[]>([]);
+  const [msg, setMsg] = useState("");
+  const load = useCallback(() => { api.audit().then(setAudit).catch((e) => setMsg(String(e.message))); }, []);
+  useEffect(load, [load]);
+  return (
+    <div>
       <div className="panel">
-        <div className="panel-head"><h3>Audit log</h3><span className="muted small grow">latest {audit.length} entries, newest first</span>
+        <div className="panel-head"><h3>{me.role === "SUPERADMIN" ? "Every bank" : "Your bank"}</h3>
+          <span className="muted small grow">latest {audit.length} entries, newest first</span>
           <button onClick={load}>Refresh</button></div>
+        {msg && <div className="error">{msg}</div>}
         <div className="table-wrap tall">
           <table className="compact" data-testid="audit">
             <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
@@ -1106,10 +1175,11 @@ function ApiKeys() {
     api.apiKeys().then(setKeys).catch((e) => { if (notFound(e)) setMissing(true); else setMsg((e as Error).message); });
   }, []);
   useEffect(load, [load]);
-  if (missing) return <><h4>API keys</h4><p className="muted">This server does not manage per-organisation API keys yet.</p></>;
+  if (missing) return <div className="panel"><p className="muted">This server does not manage per-organisation API keys yet.</p></div>;
   return (
-    <>
-      <h4>API keys <span className="muted">for systems that send payments to this organisation</span></h4>
+    <div className="panel narrow">
+      <p className="muted">Give each system that sends you payments its own key, so you can revoke one without touching the others.
+        A key is shown once, when you make it. Payments sent with it are always filed under your bank.</p>
       {fresh && (
         <div className="notice" role="status">
           Key for <b>{fresh.label}</b>, shown only now: <code className="secret">{fresh.key}</code>{" "}
@@ -1139,7 +1209,7 @@ function ApiKeys() {
         <label className="inline">Label<input value={label} placeholder="core banking" onChange={(e) => setLabel(e.target.value)} /></label>
         <button type="submit" disabled={!label.trim()}>Create key</button>
       </form>
-    </>
+    </div>
   );
 }
 

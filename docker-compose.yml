@@ -50,7 +50,11 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    # noeviction on purpose: silently dropping an account's history would give wrong features.
+    # Size it from docs/DEPLOYMENT.md (about 90 bytes per payment in the last 25 hours).
+    # Sorted sets up to 1,024 entries stay in the compact listpack encoding.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "${REDIS_MAXMEMORY:-1gb}", "--maxmemory-policy",
+              "noeviction", "--zset-max-listpack-entries", "1024"]
     ports: ["6379:6379"]
     volumes: [redis-data:/data]
     healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, retries: 20 }

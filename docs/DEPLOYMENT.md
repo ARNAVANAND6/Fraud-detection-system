@@ -73,10 +73,54 @@ Delivery is at-least-once with idempotent storage. It is not exactly-once.
 
 ## Capacity
 
-Measured with `tools/loadtest.py` on a 4-core test machine, direct mode, one scorer process: 251.7 transactions
-per second (`reports/loadtest.json`). The limit is the scorer: it handles one event at a time with one database
-transaction each. Run the load test on your own server before committing to a volume; it only runs in the demo
-environment because it writes simulated transactions.
+Measured with `tools/loadtest.py` on one 4-core, 16 GB test machine on 16 Nov 2026, direct mode, two APIs.
+Kafka, Redis, PostgreSQL and every scorer shared that machine. The tool pushes a burst into Kafka and times how
+fast the backlog drains (`reports/loadtest_*.json`):
+
+| Scorer processes | Payments per second |
+|---|---|
+| 1 | 298 |
+| 2 | 590 |
+| 4 | 701 |
+
+From two to four scorers the machine's four cores were the limit, not the design. Redis had been emptied before
+these runs, so accounts had short histories. With the simulator's 5,000 accounts each holding about 700 payments
+of history, the same machine managed 160 payments per second with one scorer and 436 with four.
+
+What changed to get there (16 Nov 2026):
+
+- **Dashboard totals are running counts** (`stats_total`, `stats_minute`, kept by the scorer in the same
+  transaction as the payment). Before, every dashboard refresh recounted the whole `predictions` table, and
+  in the first load test that took about half the database's CPU. A recount on 816,427 stored payments matched
+  the running counts exactly.
+- **One database transaction per batch** of up to 100 payments, not one per payment. If any payment in a batch
+  fails, the batch is undone and each payment is retried on its own.
+- **Time-range counts use the index.** `clock_timestamp()` in a filter stopped PostgreSQL using the index on
+  `persisted_at`: 420 ms per count, 19 ms with `now()`.
+- **Redis history is compact and bounded.** History is kept for 25 hours, not 48. Entries are short, and sorted
+  sets of up to 1,024 entries use Redis's compact encoding. Counterparty and device keys now expire after 90 days
+  without activity; before, they never expired. Measured: one history entry went from 115 bytes to 31 bytes
+  (800 payments in one account). Across all keys it came to 115 bytes per stored payment, with 5,000 accounts
+  holding 10 payments each.
+- **A full Redis pauses scoring instead of dropping payments.** Out-of-memory is now retried like an outage, so
+  payments wait in Kafka. Before, every payment was dead-lettered until someone noticed.
+
+Sizing Redis: allow about 120 bytes for every payment in the last 25 hours, plus headroom. At 1,000 payments a
+second that is about 11 GB. Set it with `REDIS_MAXMEMORY` (default `1gb`). Eviction stays off on purpose:
+quietly dropping an account's history would give wrong features.
+
+Run the load test on your own servers before committing to a volume. It only runs in the demo environment,
+because it writes simulated transactions.
+
+### What a national-scale test still needs
+
+None of the following has been built or measured here:
+
+- Three or more machines for Kafka (replicated), a PostgreSQL primary with a standby, and Redis Cluster so
+  that feature memory is split across machines. At 10,000 payments a second, history alone is about 110 GB.
+- Partitioning `predictions` by month, with a retention policy. It grows by about 1 KB per payment.
+- Enough Kafka partitions for the number of scorers planned (6 as shipped; a scorer with no partition is idle).
+- A load test from separate client machines at the target rate, sustained for hours, with a failure injected.
 
 ## Several servers
 

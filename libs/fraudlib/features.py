@@ -11,6 +11,8 @@ earlier event time. The transaction itself is never part of its own features.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import math
 from collections import defaultdict
 from collections.abc import Iterable
@@ -24,7 +26,9 @@ from .schemas import TransactionEvent, TxnType
 WINDOW_60S = 60_000
 WINDOW_1H = 3_600_000
 WINDOW_24H = 86_400_000
-HISTORY_TTL_S = 2 * 24 * 3600  # keep a little more than the longest window
+HISTORY_KEEP_MS = WINDOW_24H + 3_600_000  # the longest window, plus an hour for late events
+HISTORY_TTL_S = 25 * 3600
+SEEN_TTL_S = 90 * 24 * 3600  # "new counterparty / device" means: not seen in the last 90 days of activity
 FAN_IN_TYPES = (TxnType.TRANSFER, TxnType.CASH_OUT)  # payments to merchants are not fan-in
 FAN_IN_READ_CAP = 2000  # inbound transfers read per lookup; the count saturates beyond this
 
@@ -48,6 +52,13 @@ FEATURE_NAMES: list[str] = [
     "is_new_device",
     "dest_senders_1h",
 ]
+
+
+def short_id(transaction_id: str) -> str:
+    """8 characters that stand for a transaction id in Redis members, so a replayed event
+    overwrites its own entry instead of adding a second one. 48 bits: a clash inside one
+    account's day is about one in 10^11."""
+    return base64.b64encode(hashlib.blake2b(transaction_id.encode(), digest_size=6).digest()).decode()
 
 
 @dataclass(frozen=True)
@@ -303,16 +314,22 @@ class RedisFeatureStore:
         history, cp_first, dev_first, dest_senders = self._read(event)
         feats = compute_features(event, history, cp_first, dev_first, dest_senders)
         p = self.r.pipeline(transaction=True)
-        p.zadd(f"hist:{acct}", {f"{event.transaction_id}|{event.amount}": now})
+        tid = short_id(event.transaction_id)
+        # Members are short ("<8-char id>|<amount>"): memory is roughly one small entry per payment
+        # in the last 25 hours, so it follows payment volume, not account count or uptime.
+        p.zadd(f"hist:{acct}", {f"{tid}|{event.amount}": now})
         # Trim relative to this event; late events never trim newer data.
-        p.zremrangebyscore(f"hist:{acct}", "-inf", now - 2 * WINDOW_24H)
+        p.zremrangebyscore(f"hist:{acct}", "-inf", now - HISTORY_KEEP_MS)
         p.expire(f"hist:{acct}", HISTORY_TTL_S)
         if cp_first is None or now < cp_first:
             p.hset(f"cp:{acct}", event.counterparty_id, now)
-        if event.device_id and (dev_first is None or now < dev_first):
-            p.hset(f"dev:{acct}", event.device_id, now)
+        p.expire(f"cp:{acct}", SEEN_TTL_S)   # these used to live for ever
+        if event.device_id:
+            if dev_first is None or now < dev_first:
+                p.hset(f"dev:{acct}", event.device_id, now)
+            p.expire(f"dev:{acct}", SEEN_TTL_S)
         if event.txn_type in FAN_IN_TYPES:
-            p.zadd(f"cpin:{dest}", {f"{acct}|{event.transaction_id}": now})
+            p.zadd(f"cpin:{dest}", {f"{acct}|{tid}": now})
             p.zremrangebyscore(f"cpin:{dest}", "-inf", now - 2 * WINDOW_1H)
             p.expire(f"cpin:{dest}", 3 * 3600)
         p.execute()
