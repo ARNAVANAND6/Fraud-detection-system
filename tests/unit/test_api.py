@@ -222,6 +222,10 @@ class FakeRepo:
     def list_audit(self, limit, org=None):
         return [a for a in self.audit_rows[::-1] if org is None or a["org_id"] == org][:limit]
 
+    def dismiss_stale(self, org, older_than_hours, actor):
+        self.alert_updates.append(("dismiss", org, older_than_hours, actor))
+        return 3
+
     def update_alert(self, alert_id, to_status, assign_to, actor, notes, org=None):
         self.alert_updates.append((alert_id, to_status, actor))
         return {"alert_id": alert_id, "status": to_status, "account_id": "C1", "priority": 1, "trigger_types": [],

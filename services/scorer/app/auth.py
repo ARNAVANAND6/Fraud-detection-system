@@ -333,6 +333,7 @@ can_ingest = require("ADMIN", SERVICE)
 can_dry_run = require("ANALYST", "ADMIN", SUPERADMIN, SERVICE)
 can_work_alerts = require("ANALYST", "ADMIN")
 admin_only = require("ADMIN", SUPERADMIN)     # an organisation's admin, for their organisation
+bank_admin_only = require("ADMIN")            # an organisation's own admin; not the platform operator
 superadmin_only = require(SUPERADMIN)         # platform-wide settings and organisations
 customer_only = require(CUSTOMER)
 signed_in = require(*PEOPLE)

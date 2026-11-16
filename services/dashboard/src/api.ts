@@ -42,7 +42,7 @@ export const SOURCE_LABEL: Record<Source, string> = {
 };
 export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
 export const LEVELS: RiskLevel[] = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
-export type AlertStatus = "OPEN" | "IN_REVIEW" | "CONFIRMED_FRAUD" | "FALSE_POSITIVE";
+export type AlertStatus = "OPEN" | "IN_REVIEW" | "CONFIRMED_FRAUD" | "FALSE_POSITIVE" | "DISMISSED";
 export type StreamStatus = "LIVE" | "IDLE" | "DELAYED" | "DISCONNECTED";
 
 export interface Txn {
@@ -79,7 +79,7 @@ export interface Stats {
   last_inference_at: string | null; risk_levels: Partial<Record<RiskLevel, number>>;
   trend: { minute: string; txns: number; high_risk: number; volume: number }[];
   by_source: { source: Source; txns: number; volume: number; high_risk: number; last_event_at: string; last_minute: number }[];
-  alerts: { total: number; open: number; in_review: number; confirmed: number; false_positive: number; escalated: number; sla_breached: number };
+  alerts: { total: number; open: number; in_review: number; confirmed: number; false_positive: number; dismissed?: number; escalated: number; sla_breached: number };
   label_quality: { labelled: number; tp: number; fp: number; fn: number };
   performance: Performance;
 }
@@ -208,6 +208,8 @@ export const api = {
   transaction: (id: string) => call<TxnDetail>(`/v1/transactions/${encodeURIComponent(id)}`),
   alerts: () => call<Alert[]>("/v1/alerts?limit=200"),
   alert: (id: number) => call<AlertDetail>(`/v1/alerts/${id}`),
+  dismissStale: (older_than_hours: number) =>
+    call<{ closed: number }>("/v1/alerts/dismiss-stale", { method: "POST", body: JSON.stringify({ older_than_hours }) }),
   updateAlert: (id: number, body: { status?: AlertStatus; assigned_to?: string }) =>
     call<Alert>(`/v1/alerts/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   config: () => call<Policy>("/v1/config"),
