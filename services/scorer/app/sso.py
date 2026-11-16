@@ -167,6 +167,7 @@ def finish(request: Request, code: str, state: str) -> dict:
         auth.audit(request, None, "SSO_REFUSED", target=user["username"], detail={"reason": "inactive"},
                    actor=user["username"])
         raise HTTPException(status_code=403, detail="SSO: your Foresentry account is deactivated")
+    auth.check_org_active(request, user)
     st.repo.link_sso_subject(user["username"], subject)
     return auth.start_session(request, user, "sso")
 

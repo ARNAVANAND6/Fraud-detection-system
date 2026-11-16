@@ -45,6 +45,10 @@ Unknown fields are rejected with 422, so a mapping mistake fails loudly.
 | `POST /v1/webhooks/generic` | Push from a system that signs its calls | HMAC signature |
 | `POST /v1/imports` | A CSV or Parquet file of past transactions | Administrator sign-in |
 
+Each organisation gets its own API key from its administrator (console, API keys, or
+`POST /v1/api-keys`). The key decides which organisation a payment belongs to; an `org_id` in the body is
+ignored. The same `transaction_id` may be used by two organisations without clashing.
+
 All three answer `202`: the transaction is durably in Kafka and will be scored. They do not return the score.
 If Kafka is unavailable they answer `503` and nothing is accepted, so the caller should retry with the same
 `transaction_id`.
@@ -128,6 +132,18 @@ raise alerts for review after a payment is submitted. It has no synchronous appr
 cannot sit inside a payment authorisation as shipped.
 
 The risk score is a model estimate for a reviewer. It is not a banking or regulatory decision.
+
+## 3a. Account holders
+
+A person with the `CUSTOMER` role is linked to one or more `account_id`s at one organisation.
+`GET /v1/me/transactions` lists their payments with a plain status (`OK`, `UNDER_REVIEW`,
+`CONFIRMED_FRAUD`) and no score. `POST /v1/me/reports` with `{"transaction_id", "kind": "NOT_ME" | "SCAM" |
+"OTHER", "note"}` opens or joins an alert (`REPORTED_BY_CUSTOMER`) for the organisation's analysts.
+Reporting the same payment again returns the first report. A payment that is not on their accounts is 404.
+
+`GET /v1/public/summary` needs no sign-in and gives platform-wide totals for the last 24 hours (payments,
+share flagged, median pipeline time, number of organisations), cached for 30 seconds, with
+`"simulated": true` in the demo environment. Nothing in it identifies an organisation, account or amount.
 
 ## 4. Feeding outcomes back
 

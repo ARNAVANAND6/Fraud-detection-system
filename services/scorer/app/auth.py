@@ -32,7 +32,10 @@ from datetime import UTC, datetime, timedelta
 from fastapi import Header, HTTPException, Request
 from redis.exceptions import RedisError
 
-ROLES = ("VIEWER", "ANALYST", "ADMIN")
+ROLES = ("VIEWER", "ANALYST", "ADMIN")    # an organisation's own staff
+SUPERADMIN = "SUPERADMIN"                 # runs the platform: every organisation
+CUSTOMER = "CUSTOMER"                     # an account holder at one organisation
+PEOPLE = (*ROLES, SUPERADMIN, CUSTOMER)
 SERVICE = "SERVICE"  # an API key, not a person
 MIN_PASSWORD_LENGTH = 10
 SESSION_HOURS = 8
@@ -189,6 +192,8 @@ class Principal:
     # Signed in with a password, in a role that must use two-factor sign-in, not enrolled yet:
     # may only enrol, look at who they are and sign out.
     limited: bool = False
+    org_id: str | None = None             # None only for SUPERADMIN
+    account_ids: tuple[str, ...] = ()     # CUSTOMER: the accounts that are theirs
 
     @property
     def is_person(self) -> bool:
@@ -203,18 +208,29 @@ def audit(request: Request, who: Principal | None, action: str, target: str | No
           detail: dict | None = None, actor: str | None = None) -> None:
     request.app.state.repo.audit(
         actor=actor or (who.name if who else "anonymous"), role=who.role if who else "NONE",
-        action=action, target=target, detail=detail or {}, ip=client_ip(request))
+        action=action, target=target, detail=detail or {}, ip=client_ip(request),
+        org_id=who.org_id if who else None)
 
 
 def start_session(request: Request, user: dict, method: str, limited: bool = False) -> dict:
     token = secrets.token_urlsafe(32)
     expires = datetime.now(UTC) + timedelta(hours=SESSION_HOURS)
     request.app.state.repo.create_session(token_digest(token), user["username"], expires, limited, method)
-    audit(request, Principal(user["username"], user["role"]), "LOGIN", detail={"method": method, "limited": limited})
-    out = {"token": token, "username": user["username"], "role": user["role"], "expires_at": expires.isoformat()}
+    audit(request, Principal(user["username"], user["role"], org_id=user.get("org_id")), "LOGIN",
+          detail={"method": method, "limited": limited})
+    out = {"token": token, "username": user["username"], "role": user["role"], "org_id": user.get("org_id"),
+           "expires_at": expires.isoformat()}
     if limited:
         out["mfa_enrolment_required"] = True
     return out
+
+
+def check_org_active(request: Request, user: dict) -> None:
+    """People of a suspended organisation cannot sign in."""
+    if user.get("org_id") and not request.app.state.repo.org_active(user["org_id"]):
+        audit(request, None, "LOGIN_REFUSED", target=user["username"], detail={"reason": "organisation suspended"},
+              actor=user["username"])
+        raise HTTPException(status_code=403, detail="your organisation's access is suspended")
 
 
 def login(request: Request, username: str, password: str) -> dict:
@@ -231,6 +247,7 @@ def login(request: Request, username: str, password: str) -> dict:
         audit(request, None, "LOGIN_FAILED", target=username, actor=username)
         raise HTTPException(status_code=401, detail="wrong username or password")
     st.login_throttle.clear(key)
+    check_org_active(request, user)
     if user.get("mfa_enabled"):
         challenge = secrets.token_urlsafe(32)
         st.repo.create_challenge(token_digest(challenge), username,
@@ -262,6 +279,7 @@ def login_second_factor(request: Request, mfa_token: str, code: str) -> dict:
         audit(request, None, "MFA_FAILED", target=user["username"], actor=user["username"])
         raise HTTPException(status_code=401, detail="wrong code")
     st.repo.delete_challenge(token_digest(mfa_token))
+    check_org_active(request, user)
     return start_session(request, user, method)
 
 
@@ -273,9 +291,17 @@ def current_principal(request: Request, authorization: str | None = Header(defau
         user = st.repo.get_session_user(token_digest(authorization[7:].strip()))
         if user is None:
             raise HTTPException(status_code=401, detail="session expired or invalid; sign in again")
-        who = Principal(user["username"], user["role"], bool(user.get("limited")))
+        if user.get("org_status") == "SUSPENDED":
+            raise HTTPException(status_code=403, detail="your organisation's access is suspended")
+        who = Principal(user["username"], user["role"], bool(user.get("limited")), user.get("org_id"),
+                        tuple(user.get("account_ids") or ()))
     elif x_api_key is not None and x_api_key in st.settings.api_keys:
-        who = Principal(f"apikey:{hashlib.sha256(x_api_key.encode()).hexdigest()[:8]}", SERVICE)
+        # Keys from API_KEYS (the environment) belong to the default organisation.
+        who = Principal(f"apikey:{hashlib.sha256(x_api_key.encode()).hexdigest()[:8]}", SERVICE, org_id="demo")
+    elif x_api_key is not None and (key := st.repo.find_api_key(hashlib.sha256(x_api_key.encode()).hexdigest())):
+        if key["org_status"] == "SUSPENDED":
+            raise HTTPException(status_code=403, detail="this organisation's access is suspended")
+        who = Principal(f"apikey:{key['prefix']}", SERVICE, org_id=key["org_id"])
     else:
         raise HTTPException(status_code=401, detail="sign in, or send a valid X-API-Key")
     if not st.limiter.allow(who.name):
@@ -301,11 +327,13 @@ def require(*allowed: str, allow_limited: bool = False):
     return dependency
 
 
-can_read = require(*ROLES, SERVICE)
+can_read = require(*ROLES, SUPERADMIN, SERVICE)
 can_ingest = require("ADMIN", SERVICE)
 # A dry-run score changes nothing, so analysts may use it to check a transaction by hand.
-can_dry_run = require("ANALYST", "ADMIN", SERVICE)
+can_dry_run = require("ANALYST", "ADMIN", SUPERADMIN, SERVICE)
 can_work_alerts = require("ANALYST", "ADMIN")
-admin_only = require("ADMIN")
-signed_in = require(*ROLES)
-signed_in_or_enrolling = require(*ROLES, allow_limited=True)
+admin_only = require("ADMIN", SUPERADMIN)     # an organisation's admin, for their organisation
+superadmin_only = require(SUPERADMIN)         # platform-wide settings and organisations
+customer_only = require(CUSTOMER)
+signed_in = require(*PEOPLE)
+signed_in_or_enrolling = require(*PEOPLE, allow_limited=True)

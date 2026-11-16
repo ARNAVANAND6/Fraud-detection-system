@@ -105,8 +105,10 @@ On a small machine set `PIPELINE_MODE=direct` in `.env` and start with
 topic and Spark is not in the scoring path (start it separately with
 `make spark` if you want the lake).
 
-Sign in to the dashboard as `admin` with the password from `ADMIN_PASSWORD` in `.env`
-(`vyrox-demo-admin` in the demo file). Add named accounts for other people under the Admin tab.
+Open http://localhost:3000 for the public home page and its scam-awareness guides; the console is at
+http://localhost:3000/console. Sign in as `admin` with the password from `ADMIN_PASSWORD` in `.env`
+(`vyrox-demo-admin` in the demo file), or as `superadmin` with `SUPERADMIN_PASSWORD`
+(`foresentry-demo-super`) to manage organisations. Add named accounts for other people under the Admin tab.
 
 Send something yourself:
 
@@ -130,12 +132,24 @@ which needs an administrator.
 
 ## Sign-in, roles and the audit log
 
+Foresentry holds several organisations (banks or payment firms) on one installation. Every payment,
+alert, label, person, API key and audit entry belongs to one organisation, and a person sees only
+their own organisation's data. Payment ids need to be unique only within an organisation.
+
 | Caller | How it authenticates | What it may do |
 |---|---|---|
-| Viewer | username and password | read everything |
-| Analyst | username and password | read, and work alerts (assign, review, confirm, dismiss) |
-| Admin | username and password | everything: settings, imports, demo scenarios, people, audit log |
-| Machine | `X-API-Key` | send transactions, dry-run scores, read. Nothing else. |
+| Superadmin | username and password | runs the platform: creates and suspends organisations, sees every organisation, changes the risk settings (they apply to all organisations) |
+| Admin | username and password | everything inside their organisation: imports, demo scenarios, people, API keys, audit log |
+| Analyst | username and password | read their organisation's data, and work its alerts |
+| Viewer | username and password | read their organisation's data |
+| Customer | username and password | an account holder: sees only payments on the accounts linked to them, and can report one as "not me" or a scam. Sees no scores or internal reasons |
+| Machine | `X-API-Key` | send transactions, dry-run scores, read. Nothing else. Keys made in the console (`fsk_...`) belong to one organisation; keys in `API_KEYS` belong to `demo` |
+
+- A customer's report becomes, or joins, an open alert for that organisation's analysts at once.
+- Suspending an organisation ends its people's sessions and stops its API keys immediately.
+- Data that existed before organisations belongs to `demo`, which keeps its old Redis keys.
+- Payment-gateway connectors and the generic webhook deliver to the organisation named in `CONNECTOR_ORG`
+  (default `demo`). Separate webhook secrets per organisation are not built yet.
 
 - Passwords are stored as salted scrypt hashes, at least 10 characters. Five failed sign-ins for one
   username from one address lock that pair out for 15 minutes.
@@ -320,6 +334,8 @@ the training data.
 - Dashboard analytics run aggregate queries over the whole `predictions` table every 2 seconds. Fine for a demo, not for millions of rows.
 - The fan-in feature shares state across accounts; with several scorer replicas two senders to one destination scored at the same instant can miss each other.
 - The risk score is an uncalibrated model probability.
+- Not proven at national scale. Two or more API and scorer processes run side by side, but Kafka, Redis and PostgreSQL are single containers and nothing has been load-tested beyond one machine (see Measured performance). Organisations share one database, separated by `org_id` in every query, not by separate databases or row-level security.
+- The scam-awareness guides on the home page are general guidance written for this project. Have them checked by banking or compliance staff before publishing them under an organisation's name.
 - No SAML single sign-on (OpenID Connect only) and no hardware security keys.
 - API and scorer run two or more of each (docker-compose.ha.yml, failover measured in docs/DEPLOYMENT.md), but Kafka, Redis and PostgreSQL as shipped are one container each. No encryption at rest, no TLS between the internal services.
 - No certification or compliance work (ISO 27001, SOC 2, PCI DSS, RBI, DPDP) and no penetration test.

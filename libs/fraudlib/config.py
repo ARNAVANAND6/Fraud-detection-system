@@ -13,6 +13,7 @@ DEMO_WEBHOOK_SECRET = "demo-webhook-secret"
 DEMO_API_KEY = "dev-key"
 DEMO_ADMIN_USERNAME = "admin"
 DEMO_ADMIN_PASSWORD = "vyrox-demo-admin"  # demo only; production refuses to start with it
+DEMO_SUPERADMIN_PASSWORD = "foresentry-demo-super"  # demo only; production refuses to start with it
 DEMO_SECRET_KEY = "vyrox-demo-secret-key"  # demo only; encrypts 2FA secrets, signs SSO state
 
 
@@ -51,6 +52,11 @@ class Settings:
     # First administrator, created at start-up if no such user exists yet.
     admin_username: str = field(default_factory=lambda: _env("ADMIN_USERNAME", DEMO_ADMIN_USERNAME).lower())
     admin_password: str = field(default_factory=lambda: _env("ADMIN_PASSWORD", DEMO_ADMIN_PASSWORD))
+    # The platform operator, who manages organisations. Created on first start.
+    superadmin_username: str = field(default_factory=lambda: _env("SUPERADMIN_USERNAME", "superadmin").lower())
+    superadmin_password: str = field(default_factory=lambda: _env("SUPERADMIN_PASSWORD", DEMO_SUPERADMIN_PASSWORD))
+    # Which organisation the Razorpay, Stripe and signed-webhook connectors deliver to.
+    connector_org: str = field(default_factory=lambda: _env("CONNECTOR_ORG", "demo"))
     # Encrypts two-factor secrets at rest. Changing it invalidates every enrolled authenticator.
     secret_key: str = field(default_factory=lambda: _env("SECRET_KEY", DEMO_SECRET_KEY))
     # Roles that must use two-factor sign-in; a password alone is refused once they have enrolled,
@@ -129,6 +135,8 @@ class Settings:
             problems.append("API_KEYS still contains the demo key")
         if self.webhook_secret in ("", DEMO_WEBHOOK_SECRET):
             problems.append("WEBHOOK_SECRET is unset or the demo secret")
+        if self.superadmin_password == DEMO_SUPERADMIN_PASSWORD:
+            problems.append("SUPERADMIN_PASSWORD is unset or the demo password")
         if self.admin_password == DEMO_ADMIN_PASSWORD:
             problems.append("ADMIN_PASSWORD is unset or the demo password")
         if self.secret_key == DEMO_SECRET_KEY or len(self.secret_key) < 32:

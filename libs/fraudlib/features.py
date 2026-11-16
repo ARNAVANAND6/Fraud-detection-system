@@ -266,14 +266,21 @@ class RedisFeatureStore:
     def __init__(self, redis_client) -> None:
         self.r = redis_client
 
+    @staticmethod
+    def _ns(event: TransactionEvent, key: str) -> str:
+        # Each organisation has its own key space; "demo" keeps the original keys.
+        org = event.org_id
+        return key if not org or org == "demo" else f"{org}|{key}"
+
     def _read(self, event: TransactionEvent):
         now = event.event_ms
-        acct = event.account_id
+        acct = self._ns(event, event.account_id)
+        dest = self._ns(event, event.counterparty_id)
         p = self.r.pipeline(transaction=False)
         p.zrangebyscore(f"hist:{acct}", now - WINDOW_24H, f"({now}", withscores=True)
         p.hget(f"cp:{acct}", event.counterparty_id)
         p.hget(f"dev:{acct}", event.device_id or "-")
-        p.zrangebyscore(f"cpin:{event.counterparty_id}", now - WINDOW_1H, f"({now}", start=0, num=FAN_IN_READ_CAP)
+        p.zrangebyscore(f"cpin:{dest}", now - WINDOW_1H, f"({now}", start=0, num=FAN_IN_READ_CAP)
         raw_hist, cp_first, dev_first, dest_senders = p.execute()
         history = []
         for member, score in raw_hist:
@@ -283,7 +290,7 @@ class RedisFeatureStore:
             history,
             int(cp_first) if cp_first is not None else None,
             int(dev_first) if dev_first is not None and event.device_id else None,
-            len({(m.decode() if isinstance(m, bytes) else m).split("|", 1)[0] for m in dest_senders}),
+            len({(m.decode() if isinstance(m, bytes) else m).rsplit("|", 1)[0] for m in dest_senders}),
         )
 
     def get_features(self, event: TransactionEvent) -> dict[str, float]:
@@ -291,7 +298,8 @@ class RedisFeatureStore:
 
     def get_and_update(self, event: TransactionEvent) -> dict[str, float]:
         now = event.event_ms
-        acct = event.account_id
+        acct = self._ns(event, event.account_id)
+        dest = self._ns(event, event.counterparty_id)
         history, cp_first, dev_first, dest_senders = self._read(event)
         feats = compute_features(event, history, cp_first, dev_first, dest_senders)
         p = self.r.pipeline(transaction=True)
@@ -304,8 +312,8 @@ class RedisFeatureStore:
         if event.device_id and (dev_first is None or now < dev_first):
             p.hset(f"dev:{acct}", event.device_id, now)
         if event.txn_type in FAN_IN_TYPES:
-            p.zadd(f"cpin:{event.counterparty_id}", {f"{acct}|{event.transaction_id}": now})
-            p.zremrangebyscore(f"cpin:{event.counterparty_id}", "-inf", now - 2 * WINDOW_1H)
-            p.expire(f"cpin:{event.counterparty_id}", 3 * 3600)
+            p.zadd(f"cpin:{dest}", {f"{acct}|{event.transaction_id}": now})
+            p.zremrangebyscore(f"cpin:{dest}", "-inf", now - 2 * WINDOW_1H)
+            p.expire(f"cpin:{dest}", 3 * 3600)
         p.execute()
         return feats

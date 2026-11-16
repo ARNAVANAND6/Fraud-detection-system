@@ -36,7 +36,7 @@ from fraudlib.scoring import Scorer
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ValidationError
 
-from . import auth, connectors, mfa, sso
+from . import auth, connectors, mfa, sso, tenancy
 from .auth import (
     Principal,
     admin_only,
@@ -44,8 +44,10 @@ from .auth import (
     can_ingest,
     can_read,
     can_work_alerts,
+    customer_only,
     signed_in,
     signed_in_or_enrolling,
+    superadmin_only,
 )
 from .gateway import Gateway, PublishError, verify_webhook
 from .metrics import API_LATENCY
@@ -109,7 +111,8 @@ async def lifespan(app: FastAPI):
         st.scorer = Scorer(s.model_dir)
         st.repo = connect_with_retry(s.database_url)
         st.repo.ensure_policy()
-        st.repo.ensure_auth(s.admin_username, auth.hash_password(s.admin_password))
+        st.repo.ensure_auth(s.admin_username, auth.hash_password(s.admin_password),
+                            s.superadmin_username, auth.hash_password(s.superadmin_password))
         st.gateway = Gateway(s, st.redis)
         st.live = LiveState(s, st.repo, st.redis, st.gateway)
         await st.live.start()
@@ -142,9 +145,10 @@ def json_response(obj, status_code: int = 200) -> Response:
     return Response(jsonlog.dumps(obj), status_code=status_code, media_type="application/json")
 
 
-def do_ingest(request: Request, events: list[TransactionEvent], source: Source) -> dict:
+def do_ingest(request: Request, events: list[TransactionEvent], source: Source, org_id: str | None = None) -> dict:
+    """Publish events for scoring, stamped with their organisation (the connectors' one by default)."""
     try:
-        return request.app.state.gateway.ingest(events, source)
+        return request.app.state.gateway.ingest(events, source, org_id or request.app.state.settings.connector_org)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from None
     except (PublishError, redis.RedisError) as exc:
@@ -157,15 +161,21 @@ class LoginRequest(BaseModel):
     password: str
 
 
+RoleName = Literal["VIEWER", "ANALYST", "ADMIN", "CUSTOMER", "SUPERADMIN"]
+
+
 class NewUser(BaseModel):
     username: str
     password: str
-    role: Literal["VIEWER", "ANALYST", "ADMIN"]
+    role: RoleName
     email: str | None = None   # lets this person sign in with single sign-on
+    org_id: str | None = None  # SUPERADMIN only; an admin always adds people to their own organisation
+    account_ids: list[str] = []   # CUSTOMER: the account holder's own accounts
 
 
 class UserChange(BaseModel):
-    role: Literal["VIEWER", "ANALYST", "ADMIN"] | None = None
+    role: RoleName | None = None
+    account_ids: list[str] | None = None
     active: bool | None = None
     password: str | None = None
     reset_mfa: bool = False    # for someone who lost their phone and recovery codes
@@ -297,8 +307,11 @@ def logout(request: Request, who: Principal = Depends(signed_in_or_enrolling),
 
 
 @app.get("/v1/auth/me")
-def me(who: Principal = Depends(signed_in_or_enrolling)) -> dict:
-    out = {"username": who.name, "role": who.role}
+def me(request: Request, who: Principal = Depends(signed_in_or_enrolling)) -> dict:
+    org = request.app.state.repo.get_org(who.org_id) if who.org_id else None
+    out = {"username": who.name, "role": who.role, "org_id": who.org_id, "org_name": org["name"] if org else None}
+    if who.role == auth.CUSTOMER:
+        out["account_ids"] = list(who.account_ids)
     if who.limited:
         out["mfa_enrolment_required"] = True
     return out
@@ -314,22 +327,41 @@ def change_own_password(body: LoginRequest, request: Request, who: Principal = D
 
 
 @app.get("/v1/users")
-def list_users(request: Request, _: Principal = Depends(admin_only)) -> Response:
-    return json_response(request.app.state.repo.list_users())
+def list_users(request: Request, org_id: str | None = None, who: Principal = Depends(admin_only)) -> Response:
+    return json_response(request.app.state.repo.list_users(tenancy.scope(who, org_id)))
+
+
+def clean_accounts(ids: list[str] | None) -> list[str] | None:
+    if ids is None:
+        return None
+    out = sorted({i.strip() for i in ids if i.strip()})
+    if len(out) > 50 or any(len(i) > 64 for i in out):
+        raise HTTPException(status_code=422, detail="account_ids: at most 50, each up to 64 characters")
+    return out
 
 
 @app.post("/v1/users", status_code=201)
 def create_user(body: NewUser, request: Request, who: Principal = Depends(admin_only)) -> Response:
+    repo = request.app.state.repo
     username = body.username.strip().lower()
     if not re.fullmatch(r"[a-z0-9._-]{3,32}", username):
         raise HTTPException(status_code=422, detail="username: 3 to 32 of a-z, 0-9, dot, dash, underscore")
+    if body.role == auth.SUPERADMIN and who.role != auth.SUPERADMIN:
+        raise HTTPException(status_code=403, detail="only a superadmin can add a superadmin")
+    org = None if body.role == auth.SUPERADMIN else tenancy.scope(who, body.org_id)
+    if body.role != auth.SUPERADMIN and not (org and repo.get_org(org)):
+        raise HTTPException(status_code=422, detail="org_id: name an existing organisation")
+    accounts = clean_accounts(body.account_ids) or []
+    if body.role == auth.CUSTOMER and not accounts:
+        raise HTTPException(status_code=422, detail="account_ids: a customer needs at least one account")
     auth.check_password_rules(body.password)
     email = clean_email(body.email)
-    if not request.app.state.repo.create_user(username, auth.hash_password(body.password), body.role, email):
+    if not repo.create_user(username, auth.hash_password(body.password), body.role, email, org, accounts):
         raise HTTPException(status_code=409, detail="that username or e-mail already exists")
-    auth.audit(request, who, "USER_CREATE", target=username, detail={"role": body.role, "email": email})
-    return json_response({"username": username, "role": body.role, "active": True, "email": email,
-                          "mfa_enabled": False, "sso": False}, 201)
+    auth.audit(request, who, "USER_CREATE", target=username,
+               detail={"role": body.role, "email": email, "org_id": org, "accounts": len(accounts)})
+    return json_response({"username": username, "role": body.role, "org_id": org, "account_ids": accounts,
+                          "active": True, "email": email, "mfa_enabled": False, "sso": False}, 201)
 
 
 @app.patch("/v1/users/{username}")
@@ -337,10 +369,13 @@ def change_user(username: str, body: UserChange, request: Request,
                 who: Principal = Depends(admin_only)) -> Response:
     if body.password is not None:
         auth.check_password_rules(body.password)
+    if body.role == auth.SUPERADMIN:
+        raise HTTPException(status_code=422, detail="role: a superadmin is added, not promoted")
     try:
         row = request.app.state.repo.update_user(
             username, body.role, body.active, auth.hash_password(body.password) if body.password else None,
-            reset_mfa=body.reset_mfa, email=clean_email(body.email))
+            reset_mfa=body.reset_mfa, email=clean_email(body.email), org=tenancy.scope(who),
+            account_ids=clean_accounts(body.account_ids))
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
     if row is None:
@@ -352,9 +387,9 @@ def change_user(username: str, body: UserChange, request: Request,
 
 
 @app.get("/v1/audit")
-def audit_log(request: Request, limit: int = Query(200, le=1000),
-              _: Principal = Depends(admin_only)) -> Response:
-    return json_response(request.app.state.repo.list_audit(limit))
+def audit_log(request: Request, limit: int = Query(200, le=1000), org_id: str | None = None,
+              who: Principal = Depends(admin_only)) -> Response:
+    return json_response(request.app.state.repo.list_audit(limit, tenancy.scope(who, org_id)))
 
 
 # ---- health and metrics ----------------------------------------------------------
@@ -395,7 +430,7 @@ def metrics() -> Response:
 @app.post("/v1/transactions", status_code=202)
 def ingest_transaction(event: TransactionEvent, request: Request, who: Principal = Depends(can_ingest)) -> dict:
     """Authenticated REST ingestion. Safe to retry: the same transaction_id is accepted once."""
-    result = do_ingest(request, [event], Source.LIVE_API)
+    result = do_ingest(request, [event], Source.LIVE_API, who.org_id)
     return {"transaction_id": event.transaction_id, "source": Source.LIVE_API.value,
             "status": "accepted" if result["accepted"] else "duplicate"}
 
@@ -519,7 +554,8 @@ def import_file(file: UploadFile, request: Request, who: Principal = Depends(adm
                 first = exc.errors(include_url=False)[0]
                 errors.append({"row": i + 1, "field": ".".join(map(str, first["loc"])), "error": first["msg"]})
     invalid = len(df) - len(events)
-    result = do_ingest(request, events, Source.HISTORICAL_IMPORT) if events else {"accepted": [], "duplicates": []}
+    result = (do_ingest(request, events, Source.HISTORICAL_IMPORT, tenancy.scope(who)) if events
+              else {"accepted": [], "duplicates": []})
     auth.audit(request, who, "IMPORT", target=file.filename,
                detail={"rows": len(df), "accepted": len(result["accepted"])})
     return {"file": file.filename, "source": Source.HISTORICAL_IMPORT.value, "rows": len(df),
@@ -548,7 +584,7 @@ def demo_scenario(body: ScenarioRequest, request: Request, who: Principal = Depe
         specs = [(now, 250000.0, 400000.0)]
     events = [TransactionEvent(transaction_id=f"TXN_SCN_{tag}_{i}", event_time=t, amount=amt,
                                old_balance_orig=bal, **base) for i, (t, amt, bal) in enumerate(specs)]
-    result = do_ingest(request, events, Source.SIMULATED_DEMO)
+    result = do_ingest(request, events, Source.SIMULATED_DEMO, tenancy.scope(who))
     auth.audit(request, who, "DEMO_SCENARIO", target=body.scenario, detail={"account_id": acct})
     return {"scenario": body.scenario, "source": Source.SIMULATED_DEMO.value, "account_id": acct,
             "transaction_ids": result["accepted"]}
@@ -568,16 +604,23 @@ def score(event: TransactionEvent, request: Request, who: Principal = Depends(ca
 
 # ---- live stream -------------------------------------------------------------------
 @app.get("/v1/stream")
-async def stream(request: Request, _: Principal = Depends(can_read)) -> StreamingResponse:
+async def stream(request: Request, org_id: str | None = None,
+                 who: Principal = Depends(can_read)) -> StreamingResponse:
+    from .live import ALL
+
     live_state = request.app.state.live
     hub = live_state.hub
-    q = hub.subscribe()
+    org = tenancy.scope(who, org_id) or ALL
+    q = hub.subscribe(org)
 
     async def gen():
         try:
             yield f"event: status\ndata: {jsonlog.dumps(live_state.status())}\n\n"
-            if live_state.latest_stats is not None:
-                yield f"event: stats\ndata: {jsonlog.dumps(live_state.latest_stats)}\n\n"
+            first = live_state.latest_stats if org == ALL else live_state.org_stats.get(org)
+            if first is None and org != ALL:
+                first = await asyncio.to_thread(request.app.state.repo.stats, None, org)
+            if first is not None:
+                yield f"event: stats\ndata: {jsonlog.dumps(first)}\n\n"
             while q in hub.clients:
                 try:
                     event, data = await asyncio.wait_for(q.get(), timeout=5)
@@ -598,8 +641,9 @@ def status(request: Request, _: Principal = Depends(can_read)) -> Response:
 
 
 @app.get("/v1/stats")
-def stats(request: Request, source: Source | None = None, _: Principal = Depends(can_read)) -> Response:
-    out = request.app.state.repo.stats(source.value if source else None)
+def stats(request: Request, source: Source | None = None, org_id: str | None = None,
+          who: Principal = Depends(can_read)) -> Response:
+    out = request.app.state.repo.stats(source.value if source else None, tenancy.scope(who, org_id))
     out["performance"] = request.app.state.live.performance()
     return json_response(out)
 
@@ -630,14 +674,16 @@ def model_drift(request: Request, _: Principal = Depends(can_read)) -> Response:
 # ---- investigation -------------------------------------------------------------------
 @app.get("/v1/transactions/recent")
 def recent(request: Request, limit: int = Query(50, le=500), suspicious: bool = False,
-           source: Source | None = None, _: Principal = Depends(can_read)) -> Response:
+           source: Source | None = None, org_id: str | None = None,
+           who: Principal = Depends(can_read)) -> Response:
     return json_response(request.app.state.repo.recent_transactions(
-        limit, suspicious, source.value if source else None))
+        limit, suspicious, source.value if source else None, tenancy.scope(who, org_id)))
 
 
 @app.get("/v1/transactions/{transaction_id}")
-def transaction(transaction_id: str, request: Request, _: Principal = Depends(can_read)) -> Response:
-    row = request.app.state.repo.get_transaction(transaction_id)
+def transaction(transaction_id: str, request: Request, org_id: str | None = None,
+                who: Principal = Depends(can_read)) -> Response:
+    row = request.app.state.repo.get_transaction(transaction_id, tenancy.scope(who, org_id))
     if row is None:
         raise HTTPException(status_code=404, detail="transaction not found") from None
     return json_response(row)
@@ -651,13 +697,13 @@ class AlertUpdate(BaseModel):
 
 @app.get("/v1/alerts")
 def alerts(request: Request, status: str | None = None, limit: int = Query(100, le=500),
-           _: Principal = Depends(can_read)) -> Response:
-    return json_response(request.app.state.repo.list_alerts(status, limit))
+           org_id: str | None = None, who: Principal = Depends(can_read)) -> Response:
+    return json_response(request.app.state.repo.list_alerts(status, limit, tenancy.scope(who, org_id)))
 
 
 @app.get("/v1/alerts/{alert_id}")
-def alert_detail(alert_id: int, request: Request, _: Principal = Depends(can_read)) -> Response:
-    row = request.app.state.repo.get_alert(alert_id)
+def alert_detail(alert_id: int, request: Request, who: Principal = Depends(can_read)) -> Response:
+    row = request.app.state.repo.get_alert(alert_id, tenancy.scope(who))
     if row is None:
         raise HTTPException(status_code=404, detail="alert not found") from None
     return json_response(row)
@@ -671,7 +717,8 @@ def update_alert(alert_id: int, body: AlertUpdate, request: Request,
 
     st = request.app.state
     try:
-        row = st.repo.update_alert(alert_id, body.status, body.assigned_to, who.name, body.notes)
+        row = st.repo.update_alert(alert_id, body.status, body.assigned_to, who.name, body.notes,
+                                   org=tenancy.scope(who))
     except KeyError:
         raise HTTPException(status_code=404, detail="alert not found") from None
     except InvalidTransition as exc:
@@ -683,6 +730,143 @@ def update_alert(alert_id: int, body: AlertUpdate, request: Request,
     return json_response(row)
 
 
+# ---- organisations (SUPERADMIN) ------------------------------------------------------
+class NewOrg(BaseModel):
+    org_id: str
+    name: str
+    region: str = "IN"
+
+
+class OrgChange(BaseModel):
+    name: str | None = None
+    region: str | None = None
+    status: Literal["ACTIVE", "SUSPENDED"] | None = None
+
+
+def clean_org_fields(name: str | None, region: str | None) -> None:
+    if name is not None and not (1 <= len(name.strip()) <= 120):
+        raise HTTPException(status_code=422, detail="name: 1 to 120 characters")
+    if region is not None and not re.fullmatch(r"[A-Z]{2}(-[A-Z0-9]{1,3})?", region):
+        raise HTTPException(status_code=422, detail="region: a country code such as IN, or IN-MH")
+
+
+@app.get("/v1/orgs")
+def list_orgs(request: Request, _: Principal = Depends(superadmin_only)) -> Response:
+    return json_response(request.app.state.repo.list_orgs())
+
+
+@app.post("/v1/orgs", status_code=201)
+def create_org(body: NewOrg, request: Request, who: Principal = Depends(superadmin_only)) -> Response:
+    org_id = body.org_id.strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,31}", org_id):
+        raise HTTPException(status_code=422, detail="org_id: 2 to 32 of a-z, 0-9 and dash")
+    clean_org_fields(body.name, body.region)
+    row = request.app.state.repo.create_org(org_id, body.name.strip(), body.region)
+    if row is None:
+        raise HTTPException(status_code=409, detail="that organisation already exists")
+    auth.audit(request, who, "ORG_CREATE", target=org_id, detail={"name": body.name, "region": body.region})
+    return json_response(row, 201)
+
+
+@app.patch("/v1/orgs/{org_id}")
+def change_org(org_id: str, body: OrgChange, request: Request,
+               who: Principal = Depends(superadmin_only)) -> Response:
+    clean_org_fields(body.name, body.region)
+    row = request.app.state.repo.update_org(org_id, body.name, body.region, body.status)
+    if row is None:
+        raise HTTPException(status_code=404, detail="organisation not found")
+    auth.audit(request, who, "ORG_CHANGE", target=org_id, detail=body.model_dump(exclude_none=True))
+    return json_response(row)
+
+
+# ---- an organisation's API keys ------------------------------------------------------------
+class NewKey(BaseModel):
+    name: str
+    org_id: str | None = None    # SUPERADMIN only
+
+
+@app.get("/v1/api-keys")
+def list_keys(request: Request, org_id: str | None = None, who: Principal = Depends(admin_only)) -> Response:
+    return json_response(request.app.state.repo.list_api_keys(tenancy.scope(who, org_id)))
+
+
+@app.post("/v1/api-keys", status_code=201)
+def create_key(body: NewKey, request: Request, who: Principal = Depends(admin_only)) -> Response:
+    org = tenancy.scope(who, body.org_id)
+    if not org or not request.app.state.repo.get_org(org):
+        raise HTTPException(status_code=422, detail="org_id: name an existing organisation")
+    if not (1 <= len(body.name.strip()) <= 80):
+        raise HTTPException(status_code=422, detail="name: 1 to 80 characters")
+    key = "fsk_" + secrets.token_urlsafe(32)
+    row = request.app.state.repo.create_api_key(hashlib.sha256(key.encode()).hexdigest(), org, body.name.strip(),
+                                                key[:12], who.name)
+    auth.audit(request, who, "API_KEY_CREATE", target=row["key_id"], detail={"org_id": org, "name": body.name})
+    return json_response({**row, "key": key, "note": "Shown once. Store it now; only a digest is kept."}, 201)
+
+
+@app.delete("/v1/api-keys/{key_id}", status_code=204)
+def revoke_key(key_id: str, request: Request, who: Principal = Depends(admin_only)) -> Response:
+    if not request.app.state.repo.revoke_api_key(key_id, tenancy.scope(who)):
+        raise HTTPException(status_code=404, detail="key not found or already revoked")
+    auth.audit(request, who, "API_KEY_REVOKE", target=key_id)
+    return Response(status_code=204)
+
+
+# ---- account holders (CUSTOMER) -------------------------------------------------------
+class CustomerReport(BaseModel):
+    transaction_id: str
+    kind: Literal["NOT_ME", "SCAM", "OTHER"]
+    note: str | None = None
+
+
+@app.get("/v1/me/transactions")
+def my_transactions(request: Request, limit: int = Query(50, le=200),
+                    who: Principal = Depends(customer_only)) -> Response:
+    """The signed-in account holder's own payments, with a plain status and no internal scores."""
+    return json_response(request.app.state.repo.customer_transactions(who.org_id, list(who.account_ids), limit))
+
+
+@app.post("/v1/me/reports", status_code=201)
+def report_transaction(body: CustomerReport, request: Request, who: Principal = Depends(customer_only)) -> Response:
+    """"This wasn't me" or "I was scammed": the bank's analysts see it as an alert at once."""
+    from .consumer import alert_event
+
+    note = (body.note or "").strip()[:1000] or None
+    st = request.app.state
+    row = st.repo.customer_report(who.org_id, who.name, list(who.account_ids), body.transaction_id, body.kind, note)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no payment with that id on your accounts")
+    alert = row.pop("alert")
+    if hasattr(st, "gateway"):
+        st.gateway.publish_update(jsonlog.dumps(alert_event(alert, "CUSTOMER_REPORT")))
+    auth.audit(request, who, "CUSTOMER_REPORT", target=body.transaction_id, detail={"kind": body.kind})
+    return json_response(row, 201)
+
+
+@app.get("/v1/me/reports")
+def my_reports(request: Request, who: Principal = Depends(customer_only)) -> Response:
+    return json_response(request.app.state.repo.customer_reports(who.org_id, who.name))
+
+
+# ---- public figures for the home page (no sign-in) -------------------------------------
+@app.get("/v1/public/summary")
+def public_summary(request: Request) -> Response:
+    """Platform-wide totals for the last 24 hours, cached 30 seconds. Nothing identifies an
+    organisation, account or amount. In the demo environment the figures are simulated, and say so."""
+    st = request.app.state
+    cached = getattr(st, "public_cache", None)
+    if cached and time.monotonic() - cached[0] < 30:
+        return json_response(cached[1])
+    row = st.repo.public_summary()
+    n = row["transactions_24h"] or 0
+    out = {"environment": st.settings.environment, "simulated": st.settings.environment == "demo",
+           "transactions_24h": n, "flagged_share_24h": round(row["flagged_24h"] / n, 5) if n else None,
+           "p50_pipeline_ms": round(row["p50_pipeline_ms"], 1) if row["p50_pipeline_ms"] is not None else None,
+           "organisations": row["organisations"], "measured_at": datetime.now(UTC).isoformat()}
+    st.public_cache = (time.monotonic(), out)
+    return json_response(out)
+
+
 # ---- configuration -------------------------------------------------------------------
 @app.get("/v1/config")
 def get_config(request: Request, _: Principal = Depends(can_read)) -> Response:
@@ -690,7 +874,7 @@ def get_config(request: Request, _: Principal = Depends(can_read)) -> Response:
 
 
 @app.put("/v1/config")
-def put_config(policy: Policy, request: Request, who: Principal = Depends(admin_only)) -> Response:
+def put_config(policy: Policy, request: Request, who: Principal = Depends(superadmin_only)) -> Response:
     """Risk thresholds and alert settings. The scorer picks changes up within about 5 seconds."""
     before = request.app.state.repo.get_policy().model_dump(mode="json")
     saved = request.app.state.repo.set_policy(policy, who.name)

@@ -202,7 +202,8 @@ def test_sso_signs_in_a_person_an_admin_added_by_email(sso_client):
     app.state.repo.create_user("priya", "x", "ANALYST", "priya@bank.example")
     frag, state = run_sso(c, fake)
     token = frag["sso_token"][0]
-    assert c.get("/v1/auth/me", headers=bearer(token)).json() == {"username": "priya", "role": "ANALYST"}
+    assert c.get("/v1/auth/me", headers=bearer(token)).json() == {
+        "username": "priya", "role": "ANALYST", "org_id": "demo", "org_name": "Demo Bank"}
     assert app.state.repo.users["priya"]["sso_subject"] == f"{ISSUER}|user-123"
     # The state is single use: replaying the callback fails.
     replay = c.get("/v1/auth/sso/callback", params={"code": "good-code", "state": state}, follow_redirects=False)
@@ -217,7 +218,7 @@ def test_sso_refuses_unknown_people_unless_their_domain_is_allowed(sso_client, m
     app.state.settings = (s.__class__(**{**s.__dict__, "oidc_allowed_domains": ("bank.example",)}))
     frag, _ = run_sso(c, fake)
     me = c.get("/v1/auth/me", headers=bearer(frag["sso_token"][0])).json()
-    assert me == {"username": "priya", "role": "VIEWER"}
+    assert me == {"username": "priya", "role": "VIEWER", "org_id": "demo", "org_name": "Demo Bank"}
     assert login(c, "priya", "anything-at-all").status_code == 401      # SSO-made accounts have no password
 
 

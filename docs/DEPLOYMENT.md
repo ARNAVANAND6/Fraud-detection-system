@@ -17,7 +17,7 @@ PostgreSQL as shipped are one container each: if one of those stops, scoring sto
 ```bash
 cp .env.production.example .env
 # In .env set long random values for POSTGRES_PASSWORD (also inside DATABASE_URL), API_KEYS,
-# WEBHOOK_SECRET and ADMIN_PASSWORD, then add:
+# WEBHOOK_SECRET, ADMIN_PASSWORD and SUPERADMIN_PASSWORD, then add:
 #   SITE_ADDRESS=risk.example.com
 #   DASHBOARD_API_URL=
 #   PIPELINE_MODE=direct            (or spark, if the lake is wanted in the scoring path)
