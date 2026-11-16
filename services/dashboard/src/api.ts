@@ -2,8 +2,9 @@
 // token for the tab's lifetime (sessionStorage). No API key is shipped to the browser.
 export const BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
-export type Role = "VIEWER" | "ANALYST" | "ADMIN";
-export interface Me { username: string; role: Role }
+export type Role = "VIEWER" | "ANALYST" | "ADMIN" | "SUPERADMIN" | "CUSTOMER";
+/** SUPERADMIN runs the platform and belongs to no organisation; CUSTOMER is an account holder of one organisation. */
+export interface Me { username: string; role: Role; org_id?: string | null; org_name?: string | null }
 
 const TOKEN_KEY = "vyrox-session";
 let token: string | null = null;
@@ -94,7 +95,7 @@ export interface Status {
 }
 export interface User {
   username: string; role: Role; active: boolean; created_at?: string; updated_at?: string;
-  mfa_enabled?: boolean; sso?: boolean;
+  mfa_enabled?: boolean; sso?: boolean; org_id?: string | null; account_ids?: string[];
 }
 export interface Connector {
   name: string; kind: string; path: string; enabled: boolean; balance_known: boolean; last_event_at: string | null;
@@ -126,7 +127,37 @@ export interface Drift {
   features: { feature: string; psi: number; status: DriftStatus }[];
 }
 
+export interface Org {
+  org_id: string; name: string; region: string | null; status: "ACTIVE" | "SUSPENDED"; created_at: string;
+  users: number; transactions_24h: number; open_alerts: number; last_event_at: string | null;
+}
+export interface ApiKey { id: string; label: string; prefix: string; created_at: string; last_used_at: string | null; created_by?: string }
+export interface CustomerTxn {
+  transaction_id: string; event_time: string; counterparty_id: string; amount: number; channel: string;
+  status: "OK" | "UNDER_REVIEW" | "HELD"; reported: boolean;
+}
+export type ReportKind = "NOT_ME" | "SCAM" | "OTHER";
+export interface CustomerReport { report_id?: number; transaction_id: string; kind: ReportKind; note?: string | null; created_at: string; status?: string }
+/** Public, no sign-in. `simulated` is true on demonstration servers. */
+export interface PublicSummary {
+  environment: string; simulated: boolean; transactions_24h: number; flagged_share_24h: number;
+  p50_pipeline_ms: number | null; organisations: number; measured_at: string;
+}
+
 export const api = {
+  publicSummary: () => call<PublicSummary>("/v1/public/summary"),
+  orgs: () => call<Org[]>("/v1/orgs"),
+  createOrg: (org_id: string, name: string, region: string) =>
+    call<Org>("/v1/orgs", { method: "POST", body: JSON.stringify({ org_id, name, region }) }),
+  updateOrg: (org_id: string, body: { name?: string; region?: string; status?: "ACTIVE" | "SUSPENDED" }) =>
+    call<Org>(`/v1/orgs/${encodeURIComponent(org_id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  apiKeys: () => call<ApiKey[]>("/v1/api-keys"),
+  createApiKey: (label: string) => call<ApiKey & { key: string }>("/v1/api-keys", { method: "POST", body: JSON.stringify({ label }) }),
+  deleteApiKey: (id: string) => call<void>(`/v1/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  myTransactions: (limit = 50) => call<CustomerTxn[]>(`/v1/me/transactions?limit=${limit}`),
+  myReports: () => call<CustomerReport[]>("/v1/me/reports"),
+  report: (transaction_id: string, kind: ReportKind, note: string) =>
+    call<CustomerReport>("/v1/me/reports", { method: "POST", body: JSON.stringify({ transaction_id, kind, ...(note.trim() ? { note: note.trim() } : {}) }) }),
   login: async (username: string, password: string): Promise<LoginResult> => {
     const r = await call<(Me & { token: string }) | { mfa_required: true; mfa_token: string; expires_in: number }>(
       "/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
@@ -154,8 +185,9 @@ export const api = {
   logout: async () => { try { await call<void>("/v1/auth/logout", { method: "POST" }); } finally { session.set(null); } },
   me: () => call<Me>("/v1/auth/me"),
   users: () => call<User[]>("/v1/users"),
-  createUser: (username: string, password: string, role: Role) =>
-    call<User>("/v1/users", { method: "POST", body: JSON.stringify({ username, password, role }) }),
+  /** org_id only from a SUPERADMIN; account_ids only for CUSTOMER users. */
+  createUser: (username: string, password: string, role: Role, extra: { org_id?: string; account_ids?: string[] } = {}) =>
+    call<User>("/v1/users", { method: "POST", body: JSON.stringify({ username, password, role, ...extra }) }),
   changeUser: (username: string, body: { role?: Role; active?: boolean; password?: string; reset_mfa?: boolean }) =>
     call<User>(`/v1/users/${encodeURIComponent(username)}`, { method: "PATCH", body: JSON.stringify(body) }),
   audit: () => call<AuditRow[]>("/v1/audit?limit=200"),
